@@ -1,4 +1,5 @@
-<img width="1060" height="598" alt="image" src="https://github.com/user-attachments/assets/54067259-61e1-4c91-8688-c6bcadb44c41" />
+
+<img width="1049" height="600" alt="image" src="https://github.com/user-attachments/assets/6f1d0985-a957-45d3-a581-fd37c9a585c0" />
 
 
 # 🌽 Pay or Die
@@ -75,6 +76,8 @@ Your **score** is the total gold you earn during a run. Your best score is saved
 5. **Buy** better seeds, shovels and boosts, then repeat.
 
 Ripe crops **rot after 25 seconds**. A red **!** blinks over a crop that's about to rot, so harvest quickly. Withered crops can be cleared to reuse the soil.
+
+<img width="1060" height="598" alt="image" src="https://github.com/user-attachments/assets/68f70a78-d005-4932-b3a9-b7808dc55eef" />
 
 ---
 
