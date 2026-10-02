@@ -1,3 +1,6 @@
+<img width="1060" height="598" alt="image" src="https://github.com/user-attachments/assets/54067259-61e1-4c91-8688-c6bcadb44c41" />
+
+
 # 🌽 Pay or Die
 
 **Grow, gamble, bonk zombies... and pay the rent.**
