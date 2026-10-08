@@ -1,1 +1,2302 @@
 
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Pay or Die</title>
+<style>
+:root{
+  --bg:#2a2a22; --frame:#3d2a1f; --btn:rgba(61,42,31,.78); --btnEdge:#8b6040; --btnText:#f2ead2;
+  box-sizing:border-box;
+  padding-top:env(safe-area-inset-top,0px);
+  padding-bottom:env(safe-area-inset-bottom,0px);
+}
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){ --bg:#141317; } }
+:root[data-theme="dark"]{ --bg:#141317; }
+html{ height:100%; scroll-padding-top:env(safe-area-inset-top,0px); }
+body{ height:100%; margin:0; background:var(--bg); overflow:hidden; touch-action:none;
+  -webkit-user-select:none; user-select:none; -webkit-tap-highlight-color:transparent; }
+#wrap{ position:relative; width:100%; height:100%; display:flex; align-items:center; justify-content:center; }
+canvas{ display:block; image-rendering:pixelated; image-rendering:crisp-edges; box-shadow:0 0 0 4px var(--frame); max-width:100%; cursor:crosshair; outline:none; }
+#touch{ display:none; position:absolute; inset:0; pointer-events:none; }
+#touch.on{ display:block; }
+#touch button{ pointer-events:auto; position:absolute; background:var(--btn); color:var(--btnText);
+  border:2px solid var(--btnEdge); font:bold 18px/1 monospace; border-radius:6px; touch-action:none; }
+#touch button:active,#touch button.down{ background:#8b6040; }
+.dp{ width:52px; height:52px; }
+#bU{ left:66px; bottom:126px; } #bD{ left:66px; bottom:18px; }
+#bL{ left:12px; bottom:72px; }  #bR{ left:120px; bottom:72px; }
+#bA{ right:16px; bottom:60px; width:68px; height:68px; border-radius:50%; font-size:22px; }
+#bB{ right:94px; bottom:24px; width:56px; height:56px; border-radius:50%; }
+#bP{ right:12px; top:calc(12px + env(safe-area-inset-top,0px)); width:44px; height:36px; font-size:14px; }
+#bM{ right:62px; top:calc(12px + env(safe-area-inset-top,0px)); width:44px; height:36px; font-size:14px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="480" height="270" tabindex="0" aria-label="Pay or Die game"></canvas>
+  <div id="touch">
+    <button class="dp" id="bU" data-k="up">&#9650;</button>
+    <button class="dp" id="bD" data-k="down">&#9660;</button>
+    <button class="dp" id="bL" data-k="left">&#9664;</button>
+    <button class="dp" id="bR" data-k="right">&#9654;</button>
+    <button id="bA" data-k="a">A</button>
+    <button id="bB" data-k="b">B</button>
+    <button id="bP" data-k="pause">II</button>
+    <button id="bM" data-k="mute">&#9835;</button>
+  </div>
+</div>
+<script>
+'use strict';
+/* =========================================================
+   CONFIG
+   ========================================================= */
+const W = 480, H = 270, TILE = 16, COLS = 30, ROWS = 15, MAP_Y = 30, STEP = 1 / 60;   // farm is 1.5x bigger (30x15 tiles)
+const DAY_LEN = 150;                       // seconds per day
+const RENT = [30, 70, 130, 210, 320];      // rent due at the end of each day
+const MAX_DAYS = RENT.length;
+const START_GOLD = 20;
+const ROT_TIME = 25;                       // seconds a ripe crop lasts before rotting
+const SPEED = 62;                          // player px / second
+const ZOMBIE_HP = 5;                       // a regular shovel needs 5 hits
+const ZOMBIE_SPEED = 11;                   // zombies shamble slowly
+const BONE_CHANCE = 0.3, BONE_GOLD = 15, BONE_LIFE = 12;   // defeated zombies sometimes drop a bone worth 15g
+const THREAT_EVERY = 30;
+// Stamina: every shovel swing costs one level; at zero the farmer is slow until it refills
+const STAMINA_MAX = 100, STAMINA_LEVELS = 5;
+const STAMINA_REGEN = 20, STAMINA_REGEN_TIRED = 14, STAMINA_DELAY = 0.8, TIRED_SPEED = 0.5;
+const DIFFS = {
+  easy:   { name: 'EASY',   rent: 0.7, spawn: 1.4,  zhp: 4, eat: 1.25, stam: 15 },
+  normal: { name: 'NORMAL', rent: 1,   spawn: 1,    zhp: 5, eat: 1,    stam: 20 },
+  hard:   { name: 'HARD',   rent: 1.3, spawn: 0.75, zhp: 6, eat: 0.8,  stam: 25 },
+};
+const DIFF_ORDER = ['easy', 'normal', 'hard'];
+const FENCE_HP = () => ({ easy: 4, normal: 3, hard: 2 })[SAVE.diff] || 3;   // zombie hits to break a fence section
+const diff = () => DIFFS[SAVE.diff] || DIFFS.normal;
+function rentFor(day) { return Math.round(RENT[Math.min(day, RENT.length) - 1] * diff().rent / 5) * 5; }
+// Buildings: position, size and the door tile you interact with
+const BUILDINGS = {
+  shed:     { c: 26, r: 1,  w: 3, h: 3, door: [27, 3],  sign: 'SEEDS', sx: 15, sy: 21 },
+  stall:    { c: 1,  r: 6,  w: 3, h: 2, door: [3, 6],   sign: 'TOOLS', sx: 14, sy: 25 },
+  boutique: { c: 26, r: 11, w: 3, h: 3, door: [27, 11], sign: 'STYLE', sx: 15, sy: 9 },
+};                   // every 30s the threat level rises
+// Bird types: unlocked as the threat level rises
+const BIRDS = {
+  crow: { eat: 4.5, speed: 55, reward: 1, swap: null,              bar: 11 },
+  red:  { eat: 3,   speed: 72, reward: 2, swap: { k: 'r', c: 'k' }, bar: 11, unlock: 1 },
+  pink: { eat: 3.5, speed: 60, reward: 3, swap: { k: 'p', c: 'k' }, bar: 17, unlock: 2, poison: true },
+};
+const SAVE_KEY = 'farmlandop_v1';
+
+const CROPS = {
+  wheat:      { name: 'WHEAT',       cost: 2,  grow: 9,  sell: 5 },
+  strawberry: { name: 'STRAWBERRY',  cost: 4,  grow: 12, sell: 9,   fruit: true },
+  carrot:     { name: 'CARROT',      cost: 5,  grow: 15, sell: 12 },
+  blueberry:  { name: 'BLUEBERRY',   cost: 8,  grow: 18, sell: 19,  fruit: true },
+  tomato:     { name: 'TOMATO',      cost: 10, grow: 22, sell: 26 },
+  grape:      { name: 'GRAPE',       cost: 14, grow: 24, sell: 34,  fruit: true },
+  corn:       { name: 'CORN',        cost: 18, grow: 30, sell: 45 },
+  pineapple:  { name: 'PINEAPPLE',   cost: 22, grow: 32, sell: 55,  fruit: true },
+  watermelon: { name: 'WATERMELON',  cost: 30, grow: 38, sell: 75,  fruit: true },
+  pumpkin:    { name: 'PUMPKIN',     cost: 40, grow: 45, sell: 105, fruit: true },
+  mystery:    { name: 'MYSTERY',     cost: 15, grow: 24, sell: 0 },
+  rtomato:    { name: 'RUBY TOMATO', rare: true, sell: 90 },
+  gcorn:      { name: 'GOLD CORN',   rare: true, sell: 120 },
+  smelon:     { name: 'STAR MELON',  rare: true, sell: 200 },
+};
+const SEED_ORDER = ['wheat', 'strawberry', 'carrot', 'blueberry', 'tomato', 'grape', 'corn', 'pineapple', 'watermelon', 'pumpkin', 'mystery'];
+const COMMONS = SEED_ORDER.filter(k => k !== 'mystery');
+
+// The farmer starts with bare fists. Shovels are bought at the tool stand (left), each rarity has its own
+// ability, and every shovel breaks after SHOVEL_USES swings.
+const FISTS = { name: 'FISTS', rc: 12, dmg: 1 };            // 5 punches to defeat a zombie (Normal)
+const SHOVEL_USES = 27;
+const SHOVELS = {
+  rusty: { name: 'RUSTY SHOVEL', cost: 10,  rarity: 'COMMON',    rc: 7,  dmg: 2,  swap: { m: 'h', c: 't' }, desc: '3 HITS TO DEFEAT A ZOMBIE' },
+  iron:  { name: 'IRON SHOVEL',  cost: 40,  rarity: 'UNCOMMON',  rc: 9,  dmg: 2.5, kb: 170, swap: {}, desc: '2 HITS, KNOCKS ZOMBIES FAR BACK' },
+  frost: { name: 'FROST SHOVEL', cost: 90,  rarity: 'RARE',      rc: 15, dmg: 2.5, freeze: 3, swap: { m: 'c', c: 'm' }, desc: '2 HITS, FREEZES ZOMBIES FOR 3S' },
+  gold:  { name: 'GOLD SHOVEL',  cost: 180, rarity: 'EPIC',      rc: 11, dmg: 99, swap: { m: 'y' }, desc: 'ONE HIT DEFEATS ANY ZOMBIE' },
+  necro: { name: 'NECRO SHOVEL', cost: 260, rarity: 'LEGENDARY', rc: 10, dmg: 2.5, guard: true, swap: { m: 'l', c: 'y', w: 'd' }, desc: 'BEATEN ZOMBIES GUARD CROPS 40S' },
+};
+const weapon = () => (S.shovel ? SHOVELS[S.shovel] : FISTS);
+// Style shop (right, bottom): clothes are permanent, boosts last for the current day
+const HATS = {
+  straw: { name: 'STRAW HAT',  cost: 40 },
+  cap:   { name: 'RED CAP',    cost: 80 },
+  crown: { name: 'GOLD CROWN', cost: 300 },
+};
+const OUTFITS = {
+  flannel: { name: 'RED FLANNEL', cost: 50,  swap: { t: 'r', g: 'h' } },
+  snow:    { name: 'SNOW TEE',    cost: 70,  swap: { t: 'c', g: 'm' } },
+  gold:    { name: 'GOLD SUIT',   cost: 220, swap: { t: 'y', g: 'h', n: 'd' } },
+};
+const BOOSTS = {
+  speed: { name: 'SPEED TONIC', cost: 20, col: 'm', desc: 'MOVE 40% FASTER FOR THE REST OF TODAY' },
+  grow:  { name: 'GROW JUICE',  cost: 35, col: 'l', desc: 'ALL CROPS GROW 50% FASTER TODAY' },
+  luck:  { name: 'LUCKY CHARM', cost: 40, col: 'y', desc: 'TRIPLE RARE CROP CHANCE TODAY' },
+  sell:  { name: 'MARKET BELL', cost: 45, col: 'r', desc: 'HARVESTS SELL FOR 25% MORE TODAY' },
+};
+const SHOPS = {
+  seed:  { title: 'THE OLD SHED: SEEDS', items: SEED_ORDER.map(id => ({ kind: 'seed', id })) },
+  tool:  { title: 'TOOL STAND: SHOVELS', items: Object.keys(SHOVELS).map(id => ({ kind: 'shovel', id })) },
+  style: { title: 'STYLE SHOP: CLOTHES AND BOOSTS', items: [
+    ...Object.keys(HATS).map(id => ({ kind: 'hat', id })),
+    ...Object.keys(OUTFITS).map(id => ({ kind: 'outfit', id })),
+    ...Object.keys(BOOSTS).map(id => ({ kind: 'boost', id })),
+  ] },
+};
+const SHOP_ROWS = 8;
+
+/* =========================================================
+   PALETTE  (16 colours, index 0 = transparent)
+   ========================================================= */
+const PAL = [null,
+  '#1b1a1f', // 1 k outline
+  '#3d2a1f', // 2 d dark wood / beard / wet soil
+  '#5f3f2b', // 3 b soil
+  '#8b6040', // 4 w wood
+  '#4b5a2b', // 5 G dark grass
+  '#6f7d38', // 6 g grass
+  '#9aa352', // 7 t dry grass / shirt
+  '#2e5a2e', // 8 L dark leaf
+  '#5a9440', // 9 l leaf
+  '#e2b84a', // 10 y gold / corn
+  '#c4452f', // 11 r red
+  '#e3a57c', // 12 s skin
+  '#a8613f', // 13 h rust / skin shade / carrot
+  '#283149', // 14 n navy overalls
+  '#8b979a', // 15 m tin / metal
+  '#f2ead2', // 16 c cream
+  '#d77aa0', // 17 p pink (poison birds)
+];
+const CH = { k:1, d:2, b:3, w:4, G:5, g:6, t:7, L:8, l:9, y:10, r:11, s:12, h:13, n:14, m:15, c:16, p:17 };
+
+/* =========================================================
+   CANVAS
+   ========================================================= */
+const cvs = document.getElementById('game');
+const ctx = cvs.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+
+function resize() {
+  const vw = window.innerWidth, vh = window.innerHeight;
+  let s = Math.min(vw / W, vh / H);
+  s = s >= 2 ? Math.floor(s) : Math.max(s * 0.98, 0.5);   // integer scaling where the screen allows it
+  cvs.style.width = (W * s) + 'px';
+  cvs.style.height = (H * s) + 'px';
+}
+window.addEventListener('resize', resize);
+resize();
+
+function R(x, y, w, h, i) { ctx.fillStyle = PAL[i]; ctx.fillRect(x, y, w, h); }
+function newCanvas(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
+function rr(c, x, y, w, h, i) { c.fillStyle = PAL[i]; c.fillRect(x, y, w, h); }
+
+/* =========================================================
+   BITMAP FONT (3x5)
+   ========================================================= */
+const FONT = {
+  A:'010101111101101',B:'110101110101110',C:'011100100100011',D:'110101101101110',E:'111100110100111',
+  F:'111100110100100',G:'011100101101011',H:'101101111101101',I:'111010010010111',J:'001001001101010',
+  K:'101101110101101',L:'100100100100111',M:'101111111101101',N:'110101101101101',O:'010101101101010',
+  P:'110101110100100',Q:'010101101110011',R:'110101110101101',S:'011100010001110',T:'111010010010010',
+  U:'101101101101111',V:'101101101101010',W:'101101111111101',X:'101101010101101',Y:'101101010010010',
+  Z:'111001010100111','0':'111101101101111','1':'010110010010111','2':'110001010100111','3':'110001010001110',
+  '4':'101101111001001','5':'111100110001110','6':'011100111101111','7':'111001010010010','8':'111101111101111',
+  '9':'111101111001110','.':'000000000000010',',':'000000000010100','!':'010010010000010','?':'110001010000010',
+  ':':'000010000010000','-':'000000111000000','+':'000010111010000','/':'001001010100100',"'":'010010000000000',
+  '(':'010100100100010',')':'010001001001010','>':'100010001010100','<':'001010100010001','%':'101001010100101',
+  '=':'000111000111000',
+};
+function rawText(str, x, y, col, s) {
+  ctx.fillStyle = PAL[col];
+  let cx = x;
+  for (const ch of str) {
+    const g = FONT[ch];
+    if (g) for (let i = 0; i < 15; i++) if (g[i] === '1') ctx.fillRect(cx + (i % 3) * s, y + ((i / 3) | 0) * s, s, s);
+    cx += 4 * s;
+  }
+}
+function text(str, x, y, col = 16, s = 1, shadow = true) {
+  str = String(str).toUpperCase();
+  if (shadow) rawText(str, x + s, y + s, 1, s);
+  rawText(str, x, y, col, s);
+}
+function textW(str, s = 1) { return String(str).length * 4 * s - s; }
+function textC(str, y, col = 16, s = 1, shadow = true) { text(str, Math.round((W - textW(str, s)) / 2), y, col, s, shadow); }
+
+/* =========================================================
+   SPRITES (pixel arrays -> offscreen canvases)
+   ========================================================= */
+function makeSprite(rows, swap) {
+  const w = Math.max(...rows.map(r => r.length)), h = rows.length;
+  const cv = newCanvas(w, h), c = cv.getContext('2d');
+  for (let y = 0; y < h; y++) for (let x = 0; x < rows[y].length; x++) {
+    let ch = rows[y][x];
+    if (swap && swap[ch]) ch = swap[ch];
+    const i = CH[ch];
+    if (!i) continue;
+    c.fillStyle = PAL[i]; c.fillRect(x, y, 1, 1);
+  }
+  return cv;
+}
+function flip(src) {
+  const o = newCanvas(src.width, src.height), c = o.getContext('2d');
+  c.translate(src.width, 0); c.scale(-1, 1); c.drawImage(src, 0, 0);
+  return o;
+}
+
+// Zombie art and animation extracted from zombie_plain_walk.aseprite (Walk_* tags, 4 frames @100ms)
+// and zombie_plain_attack.aseprite (Attack_* tags, 6 frames). Frames are cropped; x/y are offsets in the
+// 24x24 walk canvas (attack frames were aligned to it, offset 8,14). Letters index ZPAL.
+const ZPAL = ["#1a1416", "#2e2650", "#40346a", "#542234", "#545c22", "#6a7228", "#702c3c", "#7c842e", "#f2eec4", "#466828", "#766e62", "#7caa34", "#9e9480", "#c4b8a0", "#d6f078", "#ffec96", "#ffffec"];
+const ZBODY_COLORS = 9;   // the first 9 ZPAL colours are the zombie's body; the rest are attack effects
+const ZOMBIE_WALK = {
+  down: [
+    { x: 6, y: 8, rows: ['...aaaaaa...', '..aehhhhea..', '.aehhhhhhea.', '.ahhhhhhhha.', '.ahhhhhhhha.', 'aehhihhihhea', 'aehhiffihhea', '.aheehheeha.', '..ahhhhhha..', '...aeeeea...', '..agggggga..', '.agdggggdha.', 'ahgdggggdhha', 'ahcbccccbhha', '.aabbaabbaa.', '..ahhaahha..'] },
+    { x: 7, y: 7, rows: ['...aaaaaa...', '..aehhhhea..', '.aehhhhhhea.', '.ahhhhhhhha.', '.ahhhhhhhha.', 'aehhihhihhea', 'aehhiffihhea', '.aheehheeha.', '..ahhhhhha..', '...aeeeea...', '..agggggga..', '..aagggggea.', '.aggadgggea.', '.aggadddga..', '..aaaabba...', '..abbabba...', '.....ahha...'] },
+    { x: 6, y: 8, rows: ['...aaaaaa...', '..aehhhhea..', '.aehhhhhhea.', '.ahhhhhhhha.', '.ahhhhhhhha.', 'aehhihhihhea', 'aehhiffihhea', '.aheehheeha.', '..ahhhhhha..', '...aeeeea...', '..agggggga..', '.agdggggdha.', 'ahgdggggdhha', 'ahcbccccbhha', '.aabbaabbaa.', '..ahhaahha..'] },
+    { x: 5, y: 7, rows: ['...aaaaaa...', '..aehhhhea..', '.aehhhhhhea.', '.ahhhhhhhha.', '.ahhhhhhhha.', 'aehhihhihhea', 'aehhiffihhea', '.aheehheeha.', '..ahhhhhha..', '...aeeeea...', '..agggggga..', '.adgggggaa..', '.adgggdagha.', '..agdddagha.', '...abbaaaa..', '...abbabba..', '...ahha.....'] }
+  ],
+  downside: [
+    { x: 6, y: 8, rows: ['...aaaaaa...', '..aehhhhea..', '.aehhhhhhea.', '.ahhhhhhhha.', '.ahhhhhhhha.', 'aehhhhhhhha.', 'aehhhihhiha.', '.aehhiffiha.', '..aeeehheea.', '..aaaeeeaa..', '.aggggggaaa.', 'ahgggdggaeea', 'ahgggdggaeea', 'ahccaaaaaaa.', '.aaabbabba..', '...ahha.....'] },
+    { x: 5, y: 7, rows: ['....aaaaaa....', '...aehhhhea...', '..aehhhhhhea..', '..ahhhhhhhha..', '..ahhhhhhhha..', '.aehhhhhhhha..', '.aehhhihhiha..', '..aehhiffiha..', '...aeeehheea..', '...aaaeeeaa...', '..aagggggaaa..', '.ahgggdggaeea.', 'ahhgggdggaeeea', 'ahhgaaaaaaaeea', '.aaaabbbaa.aa.', '....abcca.....', '....ahhh......'] },
+    { x: 6, y: 8, rows: ['...aaaaaa...', '..aehhhhea..', '.aehhhhhhea.', '.ahhhhhhhha.', '.ahhhhhhhha.', 'aehhhhhhhha.', 'aehhhihhiha.', '.aehhiffiha.', '..aeeehheea.', '..aaaeeeaa..', '.aggggggaaa.', 'ahgggdggaeea', 'ahgggdggaeea', 'ahccaaaaaaa.', '.aaabbabba..', '...ahha.....'] },
+    { x: 6, y: 7, rows: ['...aaaaaa..', '..aehhhhea.', '.aehhhhhhea', '.ahhhhhhhha', '.ahhhhhhhha', 'aehhhhhhhha', 'aehhhihhiha', '.aehhiffiha', '..aeeehheea', '..aaaeeeaa.', '..aggdggaa.', '..agggdgaea', '..agggdgaea', '..agggaaaa.', '..aaaaabba.', '...aababcca', '......ahhha'] }
+  ],
+  side: [
+    { x: 7, y: 8, rows: ['..aaaaa...', '.aehhhea..', 'aehhhhhea.', 'ahhhhhhha.', 'ahehhhhha.', 'aefhhhiha.', 'aefhhhihha', 'aeehheehha', '.aeehhhha.', '..aaeeaa..', '..aggggaa.', '.aggdggaea', 'agggdggaea', 'accaaaaaa.', '.aabbaba..', '..ahha....'] },
+    { x: 5, y: 7, rows: ['....aaaaa....', '...aehhhea...', '..aehhhhhea..', '..ahhhhhhha..', '..ahehhhhha..', '..aefhhhiha..', '..aefhhhihha.', '..aeehheehha.', '...aeehhhha..', '...aaaeeaaaa.', '.aaggggggaeea', 'ahhgggggdaeea', 'ahhaaddddaaa.', '.aa.aaaaaa...', '...aaabba....', '...aaabcca...', '......ahhha..'] },
+    { x: 7, y: 8, rows: ['..aaaaa...', '.aehhhea..', 'aehhhhhea.', 'ahhhhhhha.', 'ahehhhhha.', 'aefhhhiha.', 'aefhhhihha', 'aeehheehha', '.aeehhhha.', '..aaeeaa..', '..aggggaa.', '.aggdggaea', 'agggdggaea', 'accaaaaaa.', '.aabbaba..', '..ahha....'] },
+    { x: 7, y: 7, rows: ['..aaaaa...', '.aehhhea..', 'aehhhhhea.', 'ahhhhhhha.', 'ahehhhhha.', 'aefhhhiha.', 'aefhhhihha', 'aeehheehha', '.aeehhhha.', '..aaeeaa..', '..aggaa...', '.aaggga...', 'adaaggga..', 'adaaagga..', '.aabbaaa..', 'abbaaabca.', 'ahhha.....'] }
+  ],
+  upside: [
+    { x: 7, y: 8, rows: ['..aaaaa...', '.aehhhea..', 'aehhhhhea.', 'ahhhhhhha.', 'ahhhhheha.', 'ahhhhefha.', 'ahhhhefhha', 'aehhhhehha', '.aeehhhha.', '..aaeeaa..', '.aagggga..', 'adaggdgha.', 'adaggdghha', '.aaaaaahha', '..ababbaa.', '....ahha..'] },
+    { x: 7, y: 7, rows: ['..aaaaa....', '.aehhhea...', 'aehhhhhea..', 'ahhhhhhha..', 'ahhhhheha..', 'ahhhhefha..', 'ahhhhefhha.', 'aehhhhehha.', '.aeehhhha..', '..aaeeaaaa.', '.addgggeeea', 'adddgggheea', 'addaaaaaaa.', '.aaaccba...', '...accba...', '...ahha....'] },
+    { x: 7, y: 8, rows: ['..aaaaa...', '.aehhhea..', 'aehhhhhea.', 'ahhhhhhha.', 'ahhhhheha.', 'ahhhhefha.', 'ahhhhefhha', 'aehhhhehha', '.aeehhhha.', '..aaeeaa..', '.aagggga..', 'adaggdgha.', 'adaggdghha', '.aaaaaahha', '..ababbaa.', '....ahha..'] },
+    { x: 7, y: 7, rows: ['..aaaaa...', '.aehhhea..', 'aehhhhhea.', 'ahhhhhhha.', 'ahhhhheha.', 'ahhhhefha.', 'ahhhhefhha', 'aehhhhehha', '.aeehhhha.', '..aaeeaa..', '..addaa...', '..adagga..', '..adagga..', '..aaccca..', '.abaccaba.', '....aaeea.'] }
+  ],
+  up: [
+    { x: 6, y: 8, rows: ['...aaaaaa...', '..aehhhhea..', '.aehhhhhhea.', '.ahhhhhhhha.', '.ahhhhhhhha.', 'aehhhhhhhhea', 'aehhhhhhhhea', '.aehhhhhhea.', '..aeeeeeea..', '...aeeeea...', '..agggggga..', '.agdggggdha.', 'ahgdggggdhha', 'ahcbccccbhha', '.aabbaabbaa.', '..ahhaahha..'] },
+    { x: 6, y: 7, rows: ['...aaaaaa...', '..aehhhhea..', '.aehhhhhhea.', '.ahhhhhhhha.', '.ahhhhhhhha.', 'aehhhhhhhhea', 'aehhhhhhhhea', '.aehhhhhhea.', '..aeeeeeea..', '...aeeeea...', '..agggggga..', '..aagggggea.', '.aggadgggea.', '.aggadddga..', '..aaaabba...', '..abbabba...', '.....ahha...'] },
+    { x: 6, y: 8, rows: ['...aaaaaa...', '..aehhhhea..', '.aehhhhhhea.', '.ahhhhhhhha.', '.ahhhhhhhha.', 'aehhhhhhhhea', 'aehhhhhhhhea', '.aehhhhhhea.', '..aeeeeeea..', '...aeeeea...', '..agggggga..', '.agdggggdha.', 'ahgdggggdhha', 'ahcbccccbhha', '.aabbaabbaa.', '..ahhaahha..'] },
+    { x: 6, y: 7, rows: ['...aaaaaa...', '..aehhhhea..', '.aehhhhhhea.', '.ahhhhhhhha.', '.ahhhhhhhha.', 'aehhhhhhhhea', 'aehhhhhhhhea', '.aehhhhhhea.', '..aeeeeeea..', '...aeeeea...', '..agggggga..', '.adgggggaa..', '.adgggdagha.', '..agdddagha.', '...abbaaaa..', '...abbabba..', '...ahha.....'] }
+  ]
+};
+const ZOMBIE_ATTACK = {
+  down: [
+    { x: 6, y: 8, rows: ['...aaaaaa...', '..aehhhhea..', '.aehhhhhhea.', '.ahhhhhhhha.', '.ahhhhhhhha.', 'aehhihhihhea', 'aehhiffihhea', '.aheehheeha.', '..ahhhhhha..', '..agggggga..', '.agdggggdha.', 'ahgdggggdhha', 'ahcbccccbhha', '.aabbaabbaa.', '..ahhaahha..'] },
+    { x: 6, y: 8, rows: ['...aaaaaa...', '..aehhhhea..', '.aehhhhhhea.', '.ahhhhhhhha.', '.ahhhhhhhha.', 'aehhihhihhea', 'aehhiffihhea', '.aheehheeha.', '..ahhhhhha..', '..agggggga..', '.agdggggdha.', 'ahgdggggdhha', 'ahcbccccbhha', '.aabbaabbaa.', '..ahhaahha..'] },
+    { x: 6, y: 8, rows: ['....aaaaaa....', '...aehhhhea...', '..aehhhhhhea..', '..ahhhhhhhha..', '..ahhhhhhhha..', '.aehhihhihhea.', '.aehhiffihhea.', '..aheehheeha..', '...ahhhhhha...', '....aeeeea....', '...agggggga...', '...aagggggea..', 'n.aggadgggean.', 'nmaggadddga.nm', '...aaaabba....', '...abbabba....', '......ahha....'] },
+    { x: 1, y: 9, rows: ['.........aaaaaa........', '........aehhhhea.......', '.......aehhhhhhea......', '.......ahhhhhhhha......', '.......ahhhhhhhha......', '......aehhihhihhea.....', '......aehhiffihhea.....', '.......aheehheeha......', '........ahhhqoha.......', '........laqqeeal.......', '......llqqgggggo.......', 'k...nkoqaagggqqea.nk..k', '...mnm.aggaqqggeamnm...', '....mm.agqqdddgqomm....', '.......oqaaabqq........', '........abbqqba....ppo.', '.........oqahha....p...'] },
+    { x: -1, y: 8, rows: ['...........aaaaaa..........', '..........aehhhhea.........', '.........aehhhhhhea........', '.........ahhhhhhhha........', '.........ahhhhhhhha........', '........aehhihhihhea.......', '........aehhiffihhea.......', '.........aheehheeha........', '..........ahhhjhha.........', '...........ooeeea..........', '....k....jagggggga....k....', 'k..n.m....aaggggjea..n.m..k', '....mkm..aggaooggea...mkm..', '...k.m...ajoadddga...m.....', '..........aaaabbaj.........', '..........abbaooa..........', '............jahha.......l..', '........................l..'] },
+    { x: 0, y: 8, rows: ['.........aaaaaa..........', '........aehhhhea.........', '.......aehhhhhhea........', '.......ahhhhhhhha........', '.......ahhhhhhhha........', '......aehhihhihhea.......', '......aehhiffihhea.......', '..k....aheehheeha.....k..', '...k....ahhhhhha.......k.', '.k.......aeeeea......k...', '....k...agggggga........k', 'm......agdggggdha...m....', '......ahgdggggdhha.......', '......ahcbccccbhha.......', '.......aabbaabbaa........', '........ahhaahha.........'] }
+  ],
+  downside: [
+    { x: 5, y: 9, rows: ['...aaaaaa...', '..aehhhhea..', '.aehhhhhhea.', '.ahhhhhhhha.', '.ahhhhhhhha.', 'aehhhhhhhha.', 'aehhhihhiha.', '.aehhiffiha.', '..aeeehheea.', '.aggggggaaa.', 'ahgggdggaeea', 'ahgggdggaeea', 'ahccaaaaaaa.', '.aaabbabba..', '...ahha.....'] },
+    { x: 3, y: 8, rows: ['.....aaaaaa...', '....aehhhhea..', '...aehhhhhhea.', '...ahhhhhhhha.', '...ahhhhhhhha.', '..aehhhhhhhha.', '..aehhhihhiha.', '...aehhiffiha.', '....aeeehheea.', '...aggggggaaa.', '..ahgggdggaeea', '..ahgggdggaeea', '..ahccaaaaaaa.', 'n..aaabbabba..', '.....ahha.....'] },
+    { x: 3, y: 8, rows: ['.......aaaaaa....', '......aehhhhea...', '.....aehhhhhhea..', '.....ahhhhhhhha..', '.....ahhhhhhhha..', '....aehhhhhhhha..', '....aehhhihhiha..', '.....aehhiffiha..', '......aeeehheea..', '......aaaeeeaa...', '.....aagggggaaa..', '....ahgggdggaeea.', '...ahhgggdggaeeea', 'n..ahhgaaaaaaaeea', 'nm..aaaabbbaa.aa.', '.......abcca.....', '.......ahhh......'] },
+    { x: -2, y: 8, rows: ['.............aaaaaa...............', '............aehhhhea..............', '...........aehhhhhhea.............', '...........ahhhhhhhha.............', '...........ahhhhhhhha.............', '..........aehhhhhhhha.............', '..........aehhhihhiha.............', '...........aehhiffihal............', '............aeeehheealo..l........', '............aaaeeeaal.q.l.o.....po', '...........aagggggaaaq..lq.l....p.', '..........ahgggdggaeeq.l.q.lo.....', 'k...nk...ahhgggdggaeeqalq.l.q.....', '...mnm...ahhgaaaaaaaeqa.q.lq...p..', '....mm....aaaabbbaalqalq..lq......', '.............abcca..ol.q..lq...po.', '.............ahhh....lq..l.q..p...', '......................o..lq...p...'] },
+    { x: -5, y: 8, rows: ['...............aaaaaa................', '..............aehhhhea...............', '.............aehhhhhhea..............', '.............ahhhhhhhha..............', '.............ahhhhhhhha..............', '............aehhhhhhhha..............', '............aehhhihhiha..............', '.............aehhiffiha..............', '..............aeeehheea..............', '..............aaaeeeaa..j............', '....k......nkaagggggaaa....j.........', 'k..n.m....mnahgggdggaeeo.k...........', '....mkm....ahhgggdggaeeoa.o...j......', '...k.m.....ahhgaaaaaaaeea.o..........', '............aaaabbbaa.ja.....o.......', '...............abcca.....o...o.......', '...............ahhh......j..........l', '............................j........'] },
+    { x: -7, y: 8, rows: ['................aaaaaa....', '...............aehhhhea...', '..............aehhhhhhea..', '..............ahhhhhhhha..', '..............ahhhhhhhha..', '.............aehhhhhhhha..', '.............aehhhihhiha..', '..k........k..aehhiffiha..', '...k......n.m..aeeehheeak.', '.k.........mkm.aaaeeeaa...', '....k.....k...aggggggaaa.k', 'm............ahgggdggaeea.', '.............ahgggdggaeea.', '.............ahccaaaaaaa..', '..............aaabbabba...', '................ahha......'] }
+  ],
+  side: [
+    { x: 6, y: 9, rows: ['..aaaaa...', '.aehhhea..', 'aehhhhhea.', 'ahhhhhhha.', 'ahehhhhha.', 'aefhhhiha.', 'aefhhhihha', 'aeehheehha', '.aeehhhha.', '..aggggaa.', '.aggdggaea', 'agggdggaea', 'accaaaaaa.', '.aabbaba..', '..ahha....'] },
+    { x: 1, y: 9, rows: ['......aaaaa...', '.....aehhhea..', '....aehhhhhea.', '....ahhhhhhha.', '....ahehhhhha.', '....aefhhhiha.', '....aefhhhihha', '....aeehheehha', '.....aeehhhha.', '......aggggaa.', '.....aggdggaea', '....agggdggaea', '....accaaaaaa.', '.....aabbaba..', 'n.....ahha....'] },
+    { x: 2, y: 7, rows: ['.........aaaaa....', '........aehhhea...', '.......aehhhhhea..', '.......ahhhhhhha..', '.......ahehhhhha..', '.......aefhhhiha..', '.......aefhhhihha.', '.......aeehheehha.', '........aeehhhha..', '........aaaeeaaaa.', '......aaggggggaeea', '.....ahhgggggdaeea', '.....ahhaaddddaaa.', '......aa.aaaaaa...', 'n.......aaabba....', 'nm..n...aaabcca...', '...........ahhha..'] },
+    { x: -3, y: 4, rows: ['................................o..', '................................p..', '................................pp.', '...............aaaaa...............', '..............aehhhea..............', '.............aehhhhhea.......lo...p', '.............ahhhhhhha....lo.lq....', '.............ahehhhhha.....lq.lq...', '.............aefhhhiha..lo.lq.lq...', '.............aefhhhihha.lq..lq.lq..', '.............aeehheehha..lq.lq.lq..', '..............aeehhhha...lq..lq.lq.', '..............aaaeeaaaa...lq.lq.lo.', '............aaggggggaeea..lq..lq...', '...........ahhgggggdaeea...lq.lo...', '...........ahhaaddddaaa....lo......', 'k...nk...n..aa.aaaaaa.k............', '...mnm...nm...aaabba...............', '....mm........aaabcca..............', '.................ahhha.............'] },
+    { x: -7, y: 3, rows: ['....................................ll', '......................................', '......................................', '......................................', '..................aaaaa...............', '.................aehhhea..............', '................aehhhhhea.............', '................ahhhhhhha.........j...', '................ahehhhhha......j......', '................aefhhhiha..........o..', '................aefhhhihha..j...o..o..', '................aeehheehha......o.....', '.................aeehhhha....o......j.', '.................aaaeeaaaa...o...o....', '...............aaggggggaeea......j....', '..............ahhgggggdaeea...j.......', '....k......nk.ahhaaddddaaa............', 'k..n.m....mnm..aa.aaaaaa..k...........', '....mkm....m.....aaabbakm.............', '...k.m...........aaabcca..............', '....................ahhha.............'] },
+    { x: -8, y: 8, rows: ['.................aaaaa...', '................aehhhea..', '...............aehhhhhea.', '...............ahhhhhhha.', '...............ahehhhhha.', '...............aefhhhiha.', '...............aefhhhihha', '...............aeehheehha', '................aeehhhha.', '.k...............aaeeaa..', '..k......k.......aggggaa.', 'k.......n.m.....aggdggaea', '...k.....mkm...agggdggaea', '........k......accaaaaaa.', '................aabbaba..', '.................ahha....'] }
+  ],
+  upside: [
+    { x: 6, y: 9, rows: ['..aaaaa...', '.aehhhea..', 'aehhhhhea.', 'ahhhhhhha.', 'ahhhhheha.', 'ahhhhefha.', 'ahhhhefhha', 'aehhhhehha', '.aeehhhha.', '.aagggga..', 'adaggdgha.', 'adaggdghha', '.aaaaaahha', '..ababbaa.', '....ahha..'] },
+    { x: 3, y: 10, rows: ['.....aaaaa...', '....aehhhea..', '...aehhhhhea.', '...ahhhhhhha.', '...ahhhhheha.', '...ahhhhefha.', '...ahhhhefhha', '...aehhhhehha', '....aeehhhha.', '....aagggga..', '...adaggdgha.', '...adaggdghha', '....aaaaaahha', '.....ababbaa.', '.......ahha..', 'n.......n....'] },
+    { x: 3, y: 6, rows: ['.......aaaaa....', '......aehhhea...', '.....aehhhhhea..', '.....ahhhhhhha..', '.....ahhhhheha..', '.....ahhhhefha..', '.....ahhhhefhha.', '.....aehhhhehha.', '......aeehhhha..', '.......aaeeaaaa.', '......addgggeeea', '.....adddgggheea', '.....addaaaaaaa.', '......aaaccba...', '........accba...', '........ahha....', 'n..........n....', 'nm..n......nm...'] },
+    { x: -2, y: -2, rows: ['....................o.........', '....................pp....o...', '........................p.p..o', '...........................pp.', '..............................', '......................oq......', '.....................ll.qqqq..', '....................o..llll.qo', '.............aaaaa.l.qq....ll.', '............aehhhea.ll.qq.....', '...........aehhhhhea..ll.qq...', '...........ahhhhhhhaq...ll.qo.', '...........ahhhhheha.qqqq.ll..', '...........ahhhhefhallll.qo...', '...........ahhhhefhha...ll....', '...........aehhhhehha.........', '............aeehhhha..........', '.............aaeeaaaa.........', '............addgggeeea........', '...........adddgggheea........', '...........addaaaaaaa.........', '............aaaccba...........', '..............accba...........', 'k...nk....n...ahhank..k.......', '...mnm....nm.....mnm..........', '....mm...........mm...........'] },
+    { x: -5, y: -4, rows: ['.....................ll.........', '.............................l..', '...............................l', '................................', '................................', '................................', '................................', '.........................j......', '...........................oo...', '..............................j.', '...............aaaaa...j........', '..............aehhhea....oo.....', '.............aehhhhhea......oj..', '.............ahhhhhhhaj.........', '.............ahhhhheha..oo......', '.............ahhhhefha.....j....', '.............ahhhhefhha.........', '.............aehhhhehha.........', '..............aeehhhha..........', '...............aaeeaaaa.........', '..............addgggeeea........', '.............adddgggheea........', '.............addaaaaaaa.........', '....k.........aaaccbak..........', 'k..n.m..........accba.m..k......', '....mkm....nk...ahha.mkm........', '...k.m....mnm.......m...........', '...........m....................'] },
+    { x: -7, y: 8, rows: ['................aaaaa.....', '...............aehhhea....', '..............aehhhhhea...', '..............ahhhhhhha...', '..............ahhhhheha...', '..............ahhhhefha...', '..............ahhhhefhha..', '..............aehhhhehha..', '...............aeehhhha...', '................aaeeaa....', '..k............aagggga.k..', '...k..........adaggdgha.k.', '.k.........k..adaggdghha..', '....k.....n.m..aaaaaahha.k', 'm..........mkm..ababbaa...', '..........k.......ahha....'] }
+  ],
+  up: [
+    { x: 6, y: 10, rows: ['...aaaaaa...', '..aehhhhea..', '.aehhhhhhea.', '.ahhhhhhhha.', '.ahhhhhhhha.', 'aehhhhhhhhea', 'aehhhhhhhhea', '.aehhhhhhea.', '..aeeeeeea..', '..agggggga..', '.agdggggdha.', 'ahgdggggdhha', 'ahcbccccbhha', '.aabbaabbaa.', '..ahhaahha..'] },
+    { x: 6, y: 10, rows: ['...aaaaaa...', '..aehhhhea..', '.aehhhhhhea.', '.ahhhhhhhha.', '.ahhhhhhhha.', 'aehhhhhhhhea', 'aehhhhhhhhea', '.aehhhhhhea.', '..aeeeeeea..', '..agggggga..', '.agdggggdha.', 'ahgdggggdhha', 'ahcbccccbhha', '.aabbaabbaa.', '..ahhaahha..'] },
+    { x: 6, y: 6, rows: ['...aaaaaa.....', '..aehhhhea....', '.aehhhhhhea...', '.ahhhhhhhha...', '.ahhhhhhhha...', 'aehhhhhhhhea..', 'aehhhhhhhhea..', '.aehhhhhhea...', '..aeeeeeea....', '...aeeeea.....', '..agggggga....', '..aagggggea...', '.aggadgggea...', '.aggadddga....', '..aaaabba.....', '..abbabba.....', 'n....ahha...n.', 'nm..........nm', '......n.......'] },
+    { x: 1, y: -5, rows: ['..........o............', '........opp............', '........p..............', '......p................', '...p........qo.........', '.opp......qqll.........', '........qqll..qo.......', '......oqll..qqll.......', '......ll..qqll.........', '........qqll...qo......', '.......oaaaaaaqll......', '.......aehhhhea........', '......aehhhhhhea.......', '......ahhhhhhhha.......', '......ahhhhhhhha.......', '.....aehhhhhhhhea......', '.....aehhhhhhhhea......', '......aehhhhhhea.......', '.......aeeeeeea........', '........aeeeea.........', '.......agggggga........', '.......aagggggea.......', '......aggadgggea.......', '......aggadddga........', '.......aaaabba.........', 'k...nk.abbabba....nk..k', '...mnm....ahha...mnm...', '....mm.....nm....mm....'] },
+    { x: -1, y: -6, rows: ['..........l................', '........l..................', '...........................', '...........................', '...........................', '..l........................', '..l...........j............', '...........oo..............', '.........j.................', '...............oj..........', '............oo.............', '..........j................', '..........aaaaaa.j.........', '.........aehhhhea..........', '........aehhhhhhea.........', '........ahhhhhhhha.........', '........ahhhhhhhha.........', '.......aehhhhhhhhea........', '.......aehhhhhhhhea........', '........aehhhhhhea.........', '.........aeeeeeea..........', '..........aeeeea...........', '.........agggggga..........', '.........aagggggea.........', '........aggadgggea.........', '........aggadddga..........', '....k....aaaabba......k....', 'k..n.m...abbabba.....n.m..k', '....mkm.....ahha......mkm..', '...k.m.......m.......m.....'] },
+    { x: 0, y: 8, rows: ['.........aaaaaa..........', '........aehhhhea.........', '.......aehhhhhhea........', '.......ahhhhhhhha........', '.......ahhhhhhhha........', '......aehhhhhhhhea.......', '......aehhhhhhhhea.......', '.......aehhhhhhea........', '........aeeeeeea.........', '.........aeeeea..........', '........agggggga.........', '..k....agdggggdha.....k..', '...k..ahgdggggdhha.....k.', '.k....ahcbccccbhha...k...', '....k..aabbaabbaa.......k', 'm.......ahhaahha....m....', '...........k.............'] }
+  ]
+};
+const ZOMBIE_ATTACK_MS = [120, 90, 60, 80, 90, 130];
+// Colour variants: guardians (Necro shovel), hit flash, frozen (Frost shovel), and the red attack glow
+const ZVARIANTS = (() => {
+  const v = { normal: ZPAL.slice() };
+  v.guard = ZPAL.map((c, i) => ({ 3: '#2e5a2e', 6: '#5a9440', 8: '#e2b84a' })[i] || c);
+  v.flash = ZPAL.map((c, i) => i > 0 && i < ZBODY_COLORS ? '#f2ead2' : c);
+  v.ice = ZPAL.map((c, i) => ({ 4: '#5f7486', 5: '#8b979a', 7: '#c8d6dc', 8: '#f2ead2' })[i] || c);
+  v.glow = ZPAL.map((c, i) => i < ZBODY_COLORS ? '#c4452f' : null);
+  return v;
+})();
+// Death animation: motion from skeleton_death.aseprite ('death' tag, 10 frames), recoloured with the zombie's design.
+// Offsets are in the zombie's 24x24 walk-canvas coordinates.
+const ZDEATH_PAL = ["#ffffff", "#657392", "#424c6e", "#1a1416", "#6a7228", "#7c842e", "#545c22", "#702c3c", "#542234"];
+const ZDEATH = [
+  { x: 3, y: 9, rows: ['......aaaaaa....', '.....aaaaaaaa...', '....aaaaaaaaaa..', '....aaaaaaaaaa..', '....aaaaaaaaaa..', '....aaaaaaaaaa..', '....aaaaaaaaaa..', '....aaaaaaaaaa..', '...aaaaaaaaaaaa.', '..aaaaaaaaaaaaaa', '..aaaaaaaaaaaaaa', '..baaaaaaaaaaaa.', '..bbbaaaaaaaa...', '.bbbcaaaaaaaac..', 'bbbccaaaacccccc.', '...cccccccccccc.', '....cccccccccc..'] },
+  { x: 3, y: 8, rows: ['......dddddd....', '.....defgffed...', '....defgffffed..', '....dffffffffd..', '....dffffffffd..', '....deddffdded..', '....dedd..dded..', '.....deeeeeed...', '....bbdddddd....', '...ddbbbbdddddd.', '..dhhddddciihhhd', '..diihiichhiciid', '..bddciiiiiiddd.', '..bbbdihhdiid...', '.bbbcdihddiidc..', 'bbbccdiidcccccc.', '...cccccccccccc.', '....cccccccccc..'] },
+  { x: 3, y: 7, rows: ['.......dddd.....', '.....ddgffed....', '....degffffed...', '...defffffffd...', '...dffffffffd...', '...dfffffdded...', '...deddf.dded...', '...dedd.eeed....', '....diiiidd.....', '....bddddb.dd...', '..ddbbbbbbddid..', '.dhhdbbbbdciidd.', '.diidbdddddihhhd', '..ddbdiichhiciid', '..bbdiidiiiiddd.', '.bbbdiihddiidc..', 'bbbccdiidcccccc.', '...cccccccccccc.', '....cccccccccc..'] },
+  { x: 3, y: 8, rows: ['......dddd......', '....ddgffed.....', '...degffffed....', '..defffffffd....', '..dffffffffd....', '..dfffffdded....', '..deddf.dded....', '..dedd.eeed.....', '...diiiidd......', '...bddddbbbdd...', '..bbbbbbbdddid..', '.ddbbbbdddcid...', 'dhhdbddcdiddidd.', 'diiddiididiidhhd', '.ddbdddiididdiid', 'bbbcdiiddddccdd.', '...cccccccccccc.', '....cccccccccc..'] },
+  { x: 2, y: 12, rows: ['.......dddd......', '.....ddgffed.....', '....degffffed....', '...defffffffd....', '...dffffffffd....', '...dfffffdded....', '...deddfgddedd...', '...deddgeeedgd...', '...bdiiiidddid...', '.ddbbddddbdcd....', 'dhidddcdcdididdd.', 'ddddiididddiddhid', '....cccccccccccc.', '.....cccccccccc..'] },
+  { x: 2, y: 16, rows: ['.....gggggg.....', '....gddddddg....', '...gdefgffedg...', '...defgffffed...', '...dffffffffd...', '...dffffffffdd..', '..gdedd..ddedgd.', 'ddgdeeeeeeeedddd', '....gggggggggggg', '.....cccccccccc.'] },
+  { x: 2, y: 14, rows: ['.....dddd.......', '....defgfdd.....', '...defgfffed....', '...dfffffffed...', '...dffffffffd...', '...deedfffffd...', '...deddgfdeed...', '...gdeeegdded...', '..bbddddiiidddc.', 'dbbdidiidddiccdc', '....cccccccccccc', '.....cccccccccc.'] },
+  { x: 3, y: 14, rows: ['....dddddd.....', '...defgffed....', '..defgffffed...', '..dffffffffd...', '..dffffffffd...', '..deedffdeed...', '..deddggdded...', '..gdeeeeeedg...', '.bdddddddddddc.', 'bdiddidccdcdcdc', '...cccccccccccc', '....cccccccccc.'] },
+  { x: 3, y: 15, rows: ['.......ddd.....', '....dddffed....', '...defgfffed...', '..defgfffffd...', '..dffffffffd...', '..dfffffdeed...', '..deedfgdded...', '.ddedd.eeeddgg.', 'diidiiiiiddcdcc', '...cccccccccccc', '....cccccccccc.'] },
+  { x: 3, y: 16, rows: ['....dddddd.....', '...defgffed....', '..defgffffed...', '..dffffffffd...', '..dffffffffd...', '..deedffdeed...', '.ddedd..ddedgg.', 'dggdeeeeeedgdgg', '...cccccccccccc', '....cccccccccc.'] }
+];
+const ZDEATH_MS = [100, 100, 100, 100, 100, 100, 100, 100, 100, 700];
+// Bone pickup: full design and spin animation from skeleton_bone.aseprite ('bone' tag, 8 frames). Offsets from its ground point.
+const BONE_PAL = ["#0e071b", "#657392", "#ffffff", "#92a1b9", "#424c6e"];
+const BONE_ANIM = [
+  { x: -5, y: -10, rows: ['.aa.b..aa.', 'accaaaacca', 'adcdccdcda', 'accaaaacca', '.aa....aa.', '..........', '..........', '..........', '...eee....', '..eeeee...', '...eee....'] },
+  { x: -5, y: -12, rows: ['.aaa.....', 'adca.....', 'accaa...b', 'aaaddab..', 'b..acdaaa', 'bbbbaacca', '..b..acda', '.....aaa.', '.........', '.........', '...eee...', '..eeeee..', '...eee...'] },
+  { x: -5, y: -13, rows: ['...aaa...', '..acdca..', '..accca..', '...ada..b', 'b..acab..', 'b..aca...', 'bbbada.b.', '..accca.b', '..acdca..', '...aaa...', '.........', '...eee...', '..eeeee..', '...eee...'] },
+  { x: -5, y: -12, rows: ['.....aaa.', '.....acda', '....aacca', 'b..acdaaa', 'aaadda...', 'accaab.b.', 'adca....b', '.aaa.....', '.........', '.........', '...eee...', '..eeeee..', '...eee...'] },
+  { x: -5, y: -10, rows: ['.aa.b..aa.', 'accaaaacca', 'adcdccdcda', 'accaaaacca', '.aa....aa.', '..........', '..........', '..........', '...eee....', '..eeeee...', '...eee....'] },
+  { x: -5, y: -12, rows: ['.aaa.....', 'adca.....', 'accaa...b', 'aaaddab..', 'b..acdaaa', 'bbbbaacca', '..b..acda', '.....aaa.', '.........', '.........', '...eee...', '..eeeee..', '...eee...'] },
+  { x: -5, y: -13, rows: ['...aaa...', '..acdca..', '..accca..', '...ada..b', 'b..acab..', 'b..aca...', 'bbbada.b.', '..accca.b', '..acdca..', '...aaa...', '.........', '...eee...', '..eeeee..', '...eee...'] },
+  { x: -5, y: -12, rows: ['.....aaa.', '.....acda', '....aacca', 'b..acdaaa', 'aaadda...', 'accaab.b.', 'adca....b', '.aaa.....', '.........', '.........', '...eee...', '..eeeee..', '...eee...'] }
+];
+const BONE_MS = [100, 100, 100, 100, 100, 100, 100, 100];
+const ZDEATH_TOTAL = ZDEATH_MS.reduce((a, b) => a + b, 0) / 1000, CORPSE_FADE = 0.6;
+// Ground: autotile blocks and furrows from ground_01_16x16.png. Each block is 3x5 tiles:
+// [inner TL, inner TR, fill] [inner BL, inner BR, background] then the 3x3 outer-edge patch.
+const GPAL = ["#71ab31", "#25443b", "#bf7958", "#eea160", "#2c5940", "#589738", "#367c42", "#316942", "#efa25f", "#da8f5c", "#c17957", "#b56d56", "#ab6455", "#a15a52", "#86494b"];
+const GROUND = {
+  sand: ["aaabcddddddddddddddddddddddcbaaadddddddddddddddd", "aaecddddddddddddddddddddddddceaadddddddddddddddd", "ffbcddddddddddddddddddddddddcbffdddddddddddddddd", "ebcddddddddddddddddddddddddddcbedddddddddddddddd", "ccddddddddddddddddddddddddddddccdddddddddddddddd", "dddddddddddddddddddddddddddddddddddddddddddddddd", "dddddddddddddddddddddddddddddddddddddddddddddddd", "dddddddddddddddddddddddddddddddddddddddddddddddd", "dddddddddddddddddddddddddddddddddddddddddddddddd", "dddddddddddddddddddddddddddddddddddddddddddddddd", "dddddddddddddddddddddddddddddddddddddddddddddddd", "dddddddddddddddddddddddddddddddddddddddddddddddd", "dddddddddddddddddddddddddddddddddddddddddddddddd", "dddddddddddddddddddddddddddddddddddddddddddddddd", "dddddddddddddddddddddddddddddddddddddddddddddddd", "dddddddddddddddddddddddddddddddddddddddddddddddd", "ddddddddddddddddddddddddddddddddaaaaaaaaaaaaaaaa", "ddddddddddddddddddddddddddddddddaaaaaaaaaaaaaaaa", "ddddddddddddddddddddddddddddddddaaaaaaaaaaaaaaaa", "ddddddddddddddddddddddddddddddddaaaaaaaaaaaaaaaa", "ddddddddddddddddddddddddddddddddaaaaaaaaaaaaaaaa", "ddddddddddddddddddddddddddddddddaaaaaaaaaaaaaaaa", "ddddddddddddddddddddddddddddddddaaaaaaaaaaaaaaaa", "ddddddddddddddddddddddddddddddddaaaaaaaaaaaaaaaa", "ddddddddddddddddddddddddddddddddaaaaaaaaaaaaaaaa", "ddddddddddddddddddddddddddddddddaaaaaaaaaaaaaaaa", "ddddddddddddddddddddddddddddddddaaaaaaaaaaaaaaaa", "ccddddddddddddddddddddddddddddccaaaaaaaaaaaaaaaa", "ebcddddddddddddddddddddddddddcbeaaaaaaaaaaaaaaaa", "ffbcddddddddddddddddddddddddcbffaaaaaaaaaaaaaaaa", "aaecddddddddddddddddddddddddceaaaaaaaaaaaaaaaaaa", "aaabcddddddddddddddddddddddcbaaaaaaaaaaaaaaaaaaa", "aaaaaaaaaaaaafaaaaaafaaaaaaafaaaaafaaaaaaaaaaaaa", "aaaaaafaaaaafgfaaaafgfaaaafgfaaaafgfaaaaafaaaaaa", "aaaaaaagaffgebgfffgebgfafgebegfafgbegffagaaaaaaa", "aaaaaafgbbeccccebeccccebbecccebbeccccebbgfaaaaaa", "afgaafgeccccdddccccdddccccddddcccdddccccegfaagfa", "aafbeeecddddddddddddddddddddddddddddddddceeebfaa", "aaaecccddddddddddddddddddddddddddddddddddccceaaa", "aafbcddddddddddddddddddddddddddddddddddddddcbfaa", "aaabcddddddddddddddddddddddddddddddddddddddcbaaa", "aafecddddddddddddddddddddddddddddddddddddddcefaa", "afgcddddddddddddddddddddddddddddddddddddddddcgfa", "fgbcddddddddddddddddddddddddddddddddddddddddcbgf", "afecddddddddddddddddddddddddddddddddddddddddcefa", "aagccddddddddddddddddddddddddddddddddddddddccgaa", "aafecddddddddddddddddddddddddddddddddddddddcefaa", "aafbcddddddddddddddddddddddddddddddddddddddcbfaa", "aaabcddddddddddddddddddddddddddddddddddddddcbaaa", "aafbcddddddddddddddddddddddddddddddddddddddcbfaa", "aageddddddddddddddddddddddddddddddddddddddddegaa", "ffecddddddddddddddddddddddddddddddddddddddddceff", "agbcddddddddddddddddddddddddddddddddddddddddcbga", "afecddddddddddddddddddddddddddddddddddddddddcefa", "aagecddddddddddddddddddddddddddddddddddddddcegaa", "aafbcddddddddddddddddddddddddddddddddddddddcbfaa", "aaabcddddddddddddddddddddddddddddddddddddddcbaaa", "aafecddddddddddddddddddddddddddddddddddddddcefaa", "afgcddddddddddddddddddddddddddddddddddddddddcgfa", "fgbcddddddddddddddddddddddddddddddddddddddddcbgf", "afecddddddddddddddddddddddddddddddddddddddddcefa", "aagccddddddddddddddddddddddddddddddddddddddccgaa", "aafecddddddddddddddddddddddddddddddddddddddcefaa", "aafbcddddddddddddddddddddddddddddddddddddddcbfaa", "aafbcddddddddddddddddddddddddddddddddddddddcbfaa", "aafecddddddddddddddddddddddddddddddddddddddcefaa", "aagccddddddddddddddddddddddddddddddddddddddccgaa", "afecddddddddddddddddddddddddddddddddddddddddcefa", "fgbcddddddddddddddddddddddddddddddddddddddddcbgf", "afgcddddddddddddddddddddddddddddddddddddddddcgfa", "aafecddddddddddddddddddddddddddddddddddddddcefaa", "aaabcddddddddddddddddddddddddddddddddddddddcbaaa", "aafbcddddddddddddddddddddddddddddddddddddddcbfaa", "aaaecccddddddddddddddddddddddddddddddddddccceaaa", "aafbeeecddddddddddddddddddddddddddddddddceeebfaa", "afgaafgeccccdddccccdddccccddddcccdddccccegfaagfa", "aaaaaafgbbeccccebeccccebbecccebbeccccebbgfaaaaaa", "aaaaaaagaffgebgfffgebgfafgebegfafgbegffagaaaaaaa", "aaaaaafaaaaafgfaaaafgfaaaafgfaaaafgfaaaaafaaaaaa", "aaaaaaaaaaaaafaaaaaafaaaaaaafaaaaafaaaaaaaaaaaaa"],
+  dark: ["aaabhgggggggggggggggggggggghbaaagggggggggggggggg", "aaehggggggggggggggggggggggggheaagggggggggggggggg", "ffbhgggggggggggggggggggggggghbffgggggggggggggggg", "ebhgggggggggggggggggggggggggghbegggggggggggggggg", "hhgggggggggggggggggggggggggggghhgggggggggggggggg", "gggggggggggggggggggggggggggggggggggggggggggggggg", "gggggggggggggggggggggggggggggggggggggggggggggggg", "gggggggggggggggggggggggggggggggggggggggggggggggg", "gggggggggggggggggggggggggggggggggggggggggggggggg", "gggggggggggggggggggggggggggggggggggggggggggggggg", "gggggggggggggggggggggggggggggggggggggggggggggggg", "gggggggggggggggggggggggggggggggggggggggggggggggg", "gggggggggggggggggggggggggggggggggggggggggggggggg", "gggggggggggggggggggggggggggggggggggggggggggggggg", "gggggggggggggggggggggggggggggggggggggggggggggggg", "gggggggggggggggggggggggggggggggggggggggggggggggg", "ggggggggggggggggggggggggggggggggaaaaaaaaaaaaaaaa", "ggggggggggggggggggggggggggggggggaaaaaaaaaaaaaaaa", "ggggggggggggggggggggggggggggggggaaaaaaaaaaaaaaaa", "ggggggggggggggggggggggggggggggggaaaaaaaaaaaaaaaa", "ggggggggggggggggggggggggggggggggaaaaaaaaaaaaaaaa", "ggggggggggggggggggggggggggggggggaaaaaaaaaaaaaaaa", "ggggggggggggggggggggggggggggggggaaaaaaaaaaaaaaaa", "ggggggggggggggggggggggggggggggggaaaaaaaaaaaaaaaa", "ggggggggggggggggggggggggggggggggaaaaaaaaaaaaaaaa", "ggggggggggggggggggggggggggggggggaaaaaaaaaaaaaaaa", "ggggggggggggggggggggggggggggggggaaaaaaaaaaaaaaaa", "hhgggggggggggggggggggggggggggghhaaaaaaaaaaaaaaaa", "ebhgggggggggggggggggggggggggghbeaaaaaaaaaaaaaaaa", "ffbhgggggggggggggggggggggggghbffaaaaaaaaaaaaaaaa", "aaehggggggggggggggggggggggggheaaaaaaaaaaaaaaaaaa", "aaabhgggggggggggggggggggggghbaaaaaaaaaaaaaaaaaaa", "aaaaaaaaaaaaafaaaaaafaaaaaaafaaaaafaaaaaaaaaaaaa", "aaaaaafaaaaafgfaaaafgfaaaafgfaaaafgfaaaaafaaaaaa", "aaaaaaagaffgebgfffgebgfafgebegfafgbegffagaaaaaaa", "aaaaaafgbbehhhhebehhhhebbehhhebbehhhhebbgfaaaaaa", "afgaafgehhhhggghhhhggghhhhgggghhhggghhhhegfaagfa", "aafbeeehggggggggggggggggggggggggggggggggheeebfaa", "aaaehhhgggggggggggggggggggggggggggggggggghhheaaa", "aafbhgggggggggggggggggggggggggggggggggggggghbfaa", "aaabhgggggggggggggggggggggggggggggggggggggghbaaa", "aafehgggggggggggggggggggggggggggggggggggggghefaa", "afghgggggggggggggggggggggggggggggggggggggggghgfa", "fgbhgggggggggggggggggggggggggggggggggggggggghbgf", "afehgggggggggggggggggggggggggggggggggggggggghefa", "aaghhgggggggggggggggggggggggggggggggggggggghhgaa", "aafehgggggggggggggggggggggggggggggggggggggghefaa", "aafbhgggggggggggggggggggggggggggggggggggggghbfaa", "aaabhgggggggggggggggggggggggggggggggggggggghbaaa", "aafbhgggggggggggggggggggggggggggggggggggggghbfaa", "aageggggggggggggggggggggggggggggggggggggggggegaa", "ffehggggggggggggggggggggggggggggggggggggggggheff", "agbhgggggggggggggggggggggggggggggggggggggggghbga", "afehgggggggggggggggggggggggggggggggggggggggghefa", "aagehgggggggggggggggggggggggggggggggggggggghegaa", "aafbhgggggggggggggggggggggggggggggggggggggghbfaa", "aaabhgggggggggggggggggggggggggggggggggggggghbaaa", "aafehgggggggggggggggggggggggggggggggggggggghefaa", "afghgggggggggggggggggggggggggggggggggggggggghgfa", "fgbhgggggggggggggggggggggggggggggggggggggggghbgf", "afehgggggggggggggggggggggggggggggggggggggggghefa", "aaghhgggggggggggggggggggggggggggggggggggggghhgaa", "aafehgggggggggggggggggggggggggggggggggggggghefaa", "aafbhgggggggggggggggggggggggggggggggggggggghbfaa", "aafbhgggggggggggggggggggggggggggggggggggggghbfaa", "aafehgggggggggggggggggggggggggggggggggggggghefaa", "aaghhgggggggggggggggggggggggggggggggggggggghhgaa", "afehgggggggggggggggggggggggggggggggggggggggghefa", "fgbhgggggggggggggggggggggggggggggggggggggggghbgf", "afghgggggggggggggggggggggggggggggggggggggggghgfa", "aafehgggggggggggggggggggggggggggggggggggggghefaa", "aaabhgggggggggggggggggggggggggggggggggggggghbaaa", "aafbhgggggggggggggggggggggggggggggggggggggghbfaa", "aaaehhhgggggggggggggggggggggggggggggggggghhheaaa", "aafbeeehggggggggggggggggggggggggggggggggheeebfaa", "afgaafgehhhhggghhhhggghhhhgggghhhggghhhhegfaagfa", "aaaaaafgbbehhhhebehhhhebbehhhebbehhhhebbgfaaaaaa", "aaaaaaagaffgebgfffgebgfafgebegfafgbegffagaaaaaaa", "aaaaaafaaaaafgfaaaafgfaaaafgfaaaafgfaaaaafaaaaaa", "aaaaaaaaaaaaafaaaaaafaaaaaaafaaaaafaaaaaaaaaaaaa"],
+  fdry: ["ijiiiiiiiiiiiiiiijiiiiijjjiiiiiiiiiiiiiiiiiiiiiiijiiiiiiiiiiiiii", "iiijkkkkkkkjkkkkjiijkkkkkkkjjijjkkkkkjkkkkkjjijjiiijkkkkkkkjjijj", "ijkllkkkllkkkkklkkkllkkkllkkkkkkkkllkkkkllkkkkjiijkllkkkllkkkkji", "ikkkkllllllklllllllllllllllkkllllllllklllllkkkkjikkkkllllllkkkkj", "jklllllllllllllllllllllllllllllllllllllllllllkkkjklllllllllllkkk", "kkklllllllllllllllllllllllllllllllllllllllllllkkkkklllllllllllkk", "kklllllllllllllllllllllllllllllllllllllllllllllkkklllllllllllllk", "klllllllllllllllllllllllllllllllllllllllllllllkkklllllllllllllkk", "kklllllllllllllllllllllllllllllllllllllllllllllkkklllllllllllllk", "kkllllllllllllllllllllllllllllllllllllllllllllkkkkllllllllllllkk", "jkkllllllllllllllllllllllllllllllllllllllllllkkkjkkllllllllllkkk", "jkklllllllllllllllllllllllllllllllllllllllllllkjjkklllllllllllkj", "ikklklllllllllllllllklllllllllllllllllllllllkkkiikklklllllllkkki", "ijkkkkkkllkkkkklljkkkkkkllkkklllkkllkkkkllkkkkjiijkkkkkkllkkkkji", "iiijjkkkkkkkkkkkiiijjkkkkkkkkkjjjkkkkkkkkkkkkjiiiiijjkkkkkkkkjii", "ijjiiiiijjjiiiijijjiiiiijjjiiijiiijjjiiijjjiiijiijjiiiiijjjiiiji"],
+  fwet: ["lmlllllllllllllllmlllllmmmlllllllllllllllllllllllmllllllllllllll", "lllmnnnnnnnmnnnnmllmnnnnnnnmmlmmnnnnnmnnnnnmmlmmlllmnnnnnnnmmlmm", "lmnoonnnoonnnnnonnnoonnnoonnnnnnnnoonnnnoonnnnmllmnoonnnoonnnnml", "lnnnnoooooonooooooooooooooonnoooooooonooooonnnnmlnnnnoooooonnnnm", "mnooooooooooooooooooooooooooooooooooooooooooonnnmnooooooooooonnn", "nnnooooooooooooooooooooooooooooooooooooooooooonnnnnooooooooooonn", "nnooooooooooooooooooooooooooooooooooooooooooooonnnooooooooooooon", "nooooooooooooooooooooooooooooooooooooooooooooonnnooooooooooooonn", "nnooooooooooooooooooooooooooooooooooooooooooooonnnooooooooooooon", "nnoooooooooooooooooooooooooooooooooooooooooooonnnnoooooooooooonn", "mnnoooooooooooooooooooooooooooooooooooooooooonnnmnnoooooooooonnn", "mnnooooooooooooooooooooooooooooooooooooooooooonmmnnooooooooooonm", "lnnonooooooooooooooonooooooooooooooooooooooonnnllnnonooooooonnnl", "lmnnnnnnoonnnnnoomnnnnnnoonnnooonnoonnnnoonnnnmllmnnnnnnoonnnnml", "lllmmnnnnnnnnnnnlllmmnnnnnnnnnmmmnnnnnnnnnnnnmlllllmmnnnnnnnnmll", "lmmlllllmmmllllmlmmlllllmmmlllmlllmmmlllmmmlllmllmmlllllmmmlllml"]
+};
+const G_SAND = 'd', G_SAND_EDGE = 'c', G_WET = { 'd': 'l', 'c': 'n' };
+const G_BAR = 'lkjonm';   // furrow bar colours (dry and wet sets)
+// Fence pieces from fence_01_16x16.png
+const FPAL = ["#ad5046", "#833941", "#ffa14f", "#db7d48", "#b45b45", "#5a2d3b", "rgba(0,0,0,0.345)"];
+const FENCE_ART = {
+  tl: ["......abb.......", ".....acddb......", ".....adddb......", ".....addebfbbbbb", ".....baaafbaaaaa", ".....fbbffffffff", ".....baaafggfbfg", ".....bbabffbfaff", ".....bbabfbaaaaa", ".....bbabfffffff", ".....gbabggg....", "......bab.gg....", "......bab.gg....", "......bab.gg....", "......bab.gg....", "......bab.gg...."],
+  h: ["................", "................", "................", "bbbbbbbbbbbbbbbb", "aaaaaaaaaaaaaaaa", "ffffffffffffffff", "gfbfggfbfggfbfgg", "bfaffbfaffbfaffb", "aaaaaaaaaaaaaaaa", "ffffffffffffffff", "................", "................", "................", "................", "................", "................"],
+  tr: ["......abb.......", ".....acddb......", ".....adddb......", "bbbbbaddeb......", "aaaaabaaaf......", "ffffffbbffgg....", "fbfggbaaafggg...", "faffbbbabfggg...", "aaaaabbabfggg...", "fffffbbabfgg....", ".....gbabggg....", "......bab.gg....", "......bab.gg....", "......bab.gg....", "......bab.gg....", "......fbf.gg...."],
+  vl: ["......bab.gg....", "......bab.gg....", "......bab.gg....", "......bab.gg....", "......bab.gg....", "......bab.gg....", "......bab.gg....", "......bab.gg....", "......bab.gg....", "......bab.gg....", "......bab.gg....", "......bab.gg....", "......bab.gg....", "......bab.gg....", "......bab.gg....", "......fbf.gg...."],
+  cross: ["......abb.......", ".....acddb......", ".....adddb......", "bbbbbaddebfbbbbb", "aaaaabaaafbaaaaa", "ffffffbbffffffff", "gfbfgbaabfgfbfgg", "bfaffbaaafffaffb", "aaaaabaaafbaaaaa", "fffffbaabfffffff", ".....gbbfg......", "................", "................", "................", "................", "................"],
+  vr: ["......abb.gg....", ".....acddbgg....", ".....adddbgg....", ".....addebgg....", ".....baaafgg....", ".....fbbffggg...", ".....baaafggg...", ".....bbabfggg...", ".....bbabfgg....", ".....bbabfgg....", ".....gbabggg....", "......bab.gg....", "......bab.gg....", "......bab.gg....", "......bab.gg....", "......fbf.gg...."],
+  bl: ["......abb.gg....", ".....acddbgg....", ".....adddbgg....", ".....addebfbbbbb", ".....baaafbaaaaa", ".....fbbffffffff", ".....baabfggfbfg", ".....baaaffbfaff", ".....baaafbaaaaa", ".....baabfffffff", ".....gbbfg......", "................", "................", "................", "................", "................"],
+  post: ["......abb.......", ".....acddb......", ".....adddb......", ".....addeb......", ".....baaaf......", ".....fbbffgg....", ".....baabfggg...", ".....baaafggg...", ".....baaafgg....", ".....baabfg.....", ".....gbbfg......", "................", "................", "................", "................", "................"],
+  br: ["......abb.gg....", ".....acddbgg....", ".....adddbgg....", "bbbbbaddebgg....", "aaaaabaaafgg....", "ffffffbbffggg...", "fbfggbaabfggg...", "faffbbaaafggg...", "aaaaabaaafgg....", "fffffbaabfg.....", ".....gbbfg......", "................", "................", "................", "................", "................"],
+  vtop: ["......abb.......", ".....acddb......", ".....adddb......", ".....addeb......", ".....baaafgg....", ".....fbbffggg...", ".....baaafggg...", ".....bbabfggg...", ".....bbabfgg....", ".....bbabfgg....", ".....gbabggg....", "......bab.gg....", "......bab.gg....", "......bab.gg....", "......bab.gg....", "......fbf.gg...."]
+};
+
+// Build a canvas from rows of palette letters
+function gCanvas(rows, pal) {
+  const h = rows.length, w = rows[0].length, cv = newCanvas(w, h), c = cv.getContext('2d');
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const ch = rows[y][x]; if (ch === '.') continue;
+    c.fillStyle = pal[ch.charCodeAt(0) - 97]; c.fillRect(x, y, 1, 1);
+  }
+  return cv;
+}
+// Quarter-tile autotiling: each 8x8 quarter picks fill / inner corner / edge / outer corner from the 3x5 block
+const QUARTERS = [[0, 0, -1, -1], [1, 0, 1, -1], [0, 1, -1, 1], [1, 1, 1, 1]];   // qx, qy, dx, dy
+function quarterTile(q, h, v, d) {
+  const [qx, qy] = QUARTERS[q];
+  if (h && v && d) return [1, 3];
+  if (h && v) return [qx, qy];                          // inner corners live in the top 2x2
+  if (h) return [1, qy ? 4 : 2];                        // top / bottom edge
+  if (v) return [qx ? 2 : 0, 3];                        // left / right edge
+  return [qx ? 2 : 0, qy ? 4 : 2];                      // outer corner
+}
+function autoRows(block, same) {          // same(dx,dy) -> neighbour is the same terrain
+  const out = [];
+  for (let y = 0; y < 16; y++) out.push(new Array(16));
+  QUARTERS.forEach(([qx, qy, dx, dy], q) => {
+    const [tx, ty] = quarterTile(q, same(dx, 0), same(0, dy), same(dx, dy));
+    for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++)
+      out[qy * 8 + y][qx * 8 + x] = block[ty * 16 + qy * 8 + y][tx * 16 + qx * 8 + x];
+  });
+  return out;
+}
+const GCACHE = new Map();
+function groundTile(key, make) {
+  let cv = GCACHE.get(key);
+  if (!cv) { cv = gCanvas(make().map(r => r.join ? r.join('') : r), GPAL); GCACHE.set(key, cv); }
+  return cv;
+}
+const HAT_ART = {
+  straw: ['....kkkk....', '...kyyyyk...', '...kddddk...', 'kkyyyyyyyykk', '.kkkkkkkkkk.'],
+  cap:   ['....kkkk....', '...krrrrk...', '..krrcrrrk..', '..kkkkkkkk..'],
+  crown: ['...y.yy.y...', '...yyyyyy...', '...yryyry...', '...kkkkkk...'],
+};
+
+// --- Crops, props and icons
+const ART = {
+  seed:   ['...........', '..d.....d..', '.dbd...dbd.'],
+  sprout: ['..l...l..', '..ll.ll..', '...lLl...', '....L....'],
+  young:  ['....l....', '..l.ll.l.', '.lllLll..', '..lLlLll.', '.ll.L.ll.', '....L....', '....L....'],
+  wither: ['..d...d..', '.dd..dd..', '..dd.d...', '...dd....', '...d.....', '..dbd....'],
+  wheat: ['..y...y...y..', '.yyy.yyy.yyy.', '.yyy.yyy.yyy.', '..y...y...y..', '..g...g...g..',
+    '..g..lg...g..', '..gl..g..lg..', '..g...gl..g..', '..g...g...g..'],
+  carrot: ['..l.l.l..', '..lllll..', '...lLl...', '..lLlLl..', '...lLl...', '..khhhk..', '..khhhk..', '...khk...'],
+  tomato: ['...l.l...', '.llLlLll.', '.rrlLlrr.', 'rrrrLrrrr', 'rcrrLrcrr', 'rrrlLlrrr', '.rrlLlrr.', '..lLLLl..', '...lLl...', '....L....'],
+  corn: ['....c....', '...lcl...', '..l.L.l..', '...yLl...', '..yyyL...', '.lyyyLl..',
+    '..yyLl.l.', '.l.yL....', 'l...L.l..', '....L..l.', '...lL....', '....L....'],
+  melon: ['....l.l....', '...lLLl....', '..kkkkkkk..', '.kgGgGgGgk.', 'kgGgGgGgGgk', 'kgGgGgGgGgk', '.kgGgGgGgk.', '..kkkkkkk..'],
+  // fruits
+  strawberry: ['..l.l.l..', '.lLlLlLl.', '..lLlLl..', '.r.lLl.r.', 'rcr.L.rcr', 'rrr.L.rrr', '.r..L..r.'],
+  blueberry:  ['...lll...', '.llLlLll.', 'lnlLlnlLl', 'lnmlnLnml', '.lnLlnml.', '..lLlLl..', '....L....'],
+  grape:      ['w.......w', 'wwwwwwwww', 'w.lLl.l.w', 'w.nmn.lLw', 'w.nnn.nmw', 'w..n..nnw', 'w.....n.w'],
+  pineapple:  ['..l.l.l..', '...lLl...', '..lLlLl..', '...kkk...', '..kyhyk..', '..khyhk..', '..kyhyk..', '..khyhk..', '...kkk...'],
+  watermelon: ['....l.l....', '...lL......', '..kkkkkkk..', '.klLlLlLlk.', 'klLlLlLlLlk', 'klLlLlLlLlk', '.klLlLlLlk.', '..kkkkkkk..'],
+  pumpkin:    ['.....L.....', '....lL.l...', '..kkkLkkk..', '.khyhyhyhk.', 'khyhyhyhyhk', 'khyhyhyhyhk', '.khyhyhyhk.', '..kkkkkkk..'],
+  crow1: ['k.......k.', 'kk.....kk.', '.kkkkkkk..', '..kkkkkcky', '...kkkkk..', '...h..h...'],
+  crow2: ['..........', '...kkkk...', '..kkkkkkk.', 'kkkkkkkcky', 'k..kkkkk..', '...h..h...'],
+  crow3: ['..........', '..........', '..kkkk....', '.kkkkkkk..', 'kkkkkkkkc.', '..h.h.kky.'],
+  hoe:    ['....mmm.', '....m.m.', '...w....', '...w....', '..w.....', '..w.....', '.w......', 'w.......'],
+  can:    ['........', '..kkk...', '.k...k..', 'kmmmmmk.k', 'kmmmmmkk.', 'kmcmmmk..', 'kmmmmmk..', '.kkkkk...'],
+  bag:    ['..kk....', '.kwwk...', 'kwwwwk..', 'kwbwwk..', 'kwwwwk..', '.kkkk...'],
+  basket: ['..wwww..', '.w....w.', 'kwwwwwwk', 'kwdwdwdk', '.kwwwwk.'],
+  shovel: ['.....kwk', '....kwk.', '...kwk..', '.kkwk...', 'kmmmk...', 'kmcmk...', 'kmmk....', '.kk.....'],
+  potion: ['..kk..', '.kwwk.', '..kk..', '.kxxk.', 'kxxcxk', 'kxxxxk', '.kkkk.'],
+  shirt:  ['.kk..kk.', 'kttkkttk', 'kttttttk', '.kgtttk.', '.kttttk.', '.kkkkkk.'],
+  coin:   ['.kkkk.', 'kyyyyk', 'kycyyk', 'kyycyk', 'kyyyyk', '.kkkk.'],
+};
+
+const SPR = {};
+// Walk cycle extracted from the attached 16x16_Walk sheet: 5 directions (Walk_Down, Walk_Down_Side,
+// Walk_Side, Walk_Up_Side, Walk_Up) x 4 frames at 100ms, recoloured as the farmer. Left-facing = mirrored.
+const WALK = {
+  down: [
+    { ht: 1, cx: 7.5, rows: ['................', '.....kkkkkk.....', '....khsssshk....', '...khsssssshk...', '...kssssssssk...', '...kssssssssk...', '..khsskssksshk..', '..khsskddksshk..', '...kddddddddk...', '....kddddddk....', '.....kddddk.....', '....ktnttntk....', '...ktnnnnnntk...', '..kttnnnnnnttk..', '..kssnnnnnnssk..', '...kknnkknnkk...', '....kddkkddk....'] },
+    { ht: 0, cx: 8.5, rows: ['......kkkkkk....', '.....khsssshk...', '....khsssssshk..', '....kssssssssk..', '....kssssssssk..', '...khsskssksshk.', '...khsskddksshk.', '....kddddddddk..', '.....kddddddk...', '......kddddk....', '.....knttnttk...', '.....kknnnnngk..', '....ktnknnnngk..', '....ksnknnnnk...', '.....kkkknnk....', '.....knnknnk....', '........kddk....'] },
+    { ht: 1, cx: 7.5, rows: ['................', '.....kkkkkk.....', '....khsssshk....', '...khsssssshk...', '...kssssssssk...', '...kssssssssk...', '..khsskssksshk..', '..khsskddksshk..', '...kddddddddk...', '....kddddddk....', '.....kddddk.....', '....ktnttntk....', '...ktnnnnnntk...', '..kttnnnnnnttk..', '..kssnnnnnnssk..', '...kknnkknnkk...', '....kddkkddk....'] },
+    { ht: 0, cx: 6.5, rows: ['....kkkkkk......', '...khsssshk.....', '..khsssssshk....', '..kssssssssk....', '..kssssssssk....', '.khsskssksshk...', '.khsskddksshk...', '..kddddddddk....', '...kddddddk.....', '....kddddk......', '...knttnttk.....', '..kgnnnnnkk.....', '..kgnnnnkntk....', '...knnnnknsk....', '....knnkkkk.....', '....knnknnk.....', '....kddk........'] }
+  ],
+  downside: [
+    { ht: 1, cx: 7, rows: ['................', '.....kkkkkk.....', '....khsssshk....', '...khsssssshk...', '...kssssssssk...', '...kssssssssk...', '..khssssssssk...', '..khssskssksk...', '...khsskddksk...', '....khddddddk...', '....kkkdddkk....', '...ktnttntkkk...', '..kttnnnnnkggk..', '..kssnnnnnkhhk..', '..kssnkkkkkkk...', '...kkknnknnk....', '.....kddk.......'] },
+    { ht: 0, cx: 7, rows: ['.....kkkkkk.....', '....khsssshk....', '...khsssssshk...', '...kssssssssk...', '...kssssssssk...', '..khssssssssk...', '..khssskssksk...', '...khsskddksk...', '....khddddddk...', '....kkkdddkk....', '...kknttntkkk...', '..kttnnnnnkggk..', '.ksssnnnnnkhhhk.', '.kssskkkkkkkhhk.', '..kkkknnnkk.kk..', '.....knddk......', '.....kddd.......'] },
+    { ht: 1, cx: 7, rows: ['................', '.....kkkkkk.....', '....khsssshk....', '...khsssssshk...', '...kssssssssk...', '...kssssssssk...', '..khssssssssk...', '..khssskssksk...', '...khsskddksk...', '....khddddddk...', '....kkkdddkk....', '...ktnttntkkk...', '..kttnnnnnkggk..', '..kssnnnnnkhhk..', '..kssnkkkkkkk...', '...kkknnknnk....', '.....kddk.......'] },
+    { ht: 0, cx: 7, rows: ['.....kkkkkk.....', '....khsssshk....', '...khsssssshk...', '...kssssssssk...', '...kssssssssk...', '..khssssssssk...', '..khssskssksk...', '...khsskddksk...', '....khddddddk...', '....kkkdddkk....', '....kntgntkk....', '....knnnnnkgk...', '....knnnnnkhk...', '....knnnkkkk....', '....kkkkknnk....', '.....kknknddk...', '........kdddk...'] }
+  ],
+  side: [
+    { ht: 1, cx: 7, rows: ['................', '.....kkkkk......', '....khssshk.....', '...khssssshk....', '...ksssssssk....', '...kshsssssk....', '...khhsssksk....', '...khhdddkssk...', '...khdddddddk...', '....kddddddk....', '.....kkddkk.....', '.....kttttkk....', '....knnnnnkgk...', '...ksnnnnnkhk...', '...ksnkkkkkk....', '....kknnknk.....', '.....kddk.......'] },
+    { ht: 0, cx: 7, rows: ['.....kkkkk......', '....khssshk.....', '...khssssshk....', '...ksssssssk....', '...kshsssssk....', '...khhsssksk....', '...khhdddkssk...', '...khdddddddk...', '....kddddddk....', '....kkkddkkkk...', '..kkttttttkggk..', '.ktttnnnnnkggk..', '.ksskknnnnkkk...', '..kk.kkkkkk.....', '....kkknnk......', '....kkknddk.....', '.......kdddk....'] },
+    { ht: 1, cx: 7, rows: ['................', '.....kkkkk......', '....khssshk.....', '...khssssshk....', '...ksssssssk....', '...kshsssssk....', '...khhsssksk....', '...khhdddkssk...', '...khdddddddk...', '....kddddddk....', '.....kkddkk.....', '.....kttttkk....', '....knnnnnkgk...', '...ksnnnnnkhk...', '...ksnkkkkkk....', '....kknnknk.....', '.....kddk.......'] },
+    { ht: 0, cx: 7, rows: ['.....kkkkk......', '....khssshk.....', '...khssssshk....', '...ksssssssk....', '...kshsssssk....', '...khhsssksk....', '...khhdddkssk...', '...khdddddddk...', '....kddddddk....', '.....kkddkk.....', '.....kttkk......', '....kknnnk......', '...khkknnnk.....', '...khkkknnk.....', '....kknnkkk.....', '...knnkkkndk....', '...kdddk........'] }
+  ],
+  upside: [
+    { ht: 1, cx: 7, rows: ['................', '.....kkkkk......', '....khssshk.....', '...khssssshk....', '...ksssssssk....', '...kssssshsk....', '...ksssshhsk....', '...ksssshhssk...', '...khsssshssk...', '....khhssssk....', '.....kkhhkk.....', '....kkttntk.....', '...kgknnnntk....', '...khknnnnssk...', '....kkkkkkssk...', '.....knknnkk....', '.......kddk.....'] },
+    { ht: 0, cx: 7, rows: ['.....kkkkk......', '....khssshk.....', '...khssssshk....', '...ksssssssk....', '...kssssshsk....', '...ksssshhsk....', '...ksssshhssk...', '...khsssshssk...', '....khhssssk....', '.....kkhhkkkk...', '....kngtntgggk..', '...kgnnnnntggk..', '...khnkkkkkkk...', '....kkknnnk.....', '......kddnk.....', '......kddk......', '................'] },
+    { ht: 1, cx: 7, rows: ['................', '.....kkkkk......', '....khssshk.....', '...khssssshk....', '...ksssssssk....', '...kssssshsk....', '...ksssshhsk....', '...ksssshhssk...', '...khsssshssk...', '....khhssssk....', '.....kkhhkk.....', '....kkttntk.....', '...kgknnnntk....', '...khknnnnssk...', '....kkkkkkssk...', '.....knknnkk....', '.......kddk.....'] },
+    { ht: 0, cx: 7, rows: ['.....kkkkk......', '....khssshk.....', '...khssssshk....', '...ksssssssk....', '...kssssshsk....', '...ksssshhsk....', '...ksssshhssk...', '...khsssshssk...', '....khhssssk....', '.....kkhhkk.....', '.....kggkk......', '.....knknnk.....', '.....knknnk.....', '.....kknnnk.....', '....knkddknk....', '.......kknnk....', '................'] }
+  ],
+  up: [
+    { ht: 1, cx: 7.5, rows: ['................', '.....kkkkkk.....', '....khsssshk....', '...khsssssshk...', '...kssssssssk...', '...kssssssssk...', '..khsssssssshk..', '..khsssssssshk..', '...khsssssshk...', '....khhhhhhk....', '.....khhhhk.....', '....ktnttntk....', '...ktnnnnnntk...', '..kttnnnnnnttk..', '..kssnnnnnnssk..', '...kknnkknnkk...', '....kddkkddk....'] },
+    { ht: 0, cx: 7.5, rows: ['.....kkkkkk.....', '....khsssshk....', '...khsssssshk...', '...kssssssssk...', '...kssssssssk...', '..khsssssssshk..', '..khsssssssshk..', '...khsssssshk...', '....khhhhhhk....', '.....khhhhk.....', '....ktnttntk....', '....kknnnnngk...', '...ktnknnnngk...', '...ksnknnnnk....', '....kkkknnk.....', '....knnknnk.....', '.......kddk.....'] },
+    { ht: 1, cx: 7.5, rows: ['................', '.....kkkkkk.....', '....khsssshk....', '...khsssssshk...', '...kssssssssk...', '...kssssssssk...', '..khsssssssshk..', '..khsssssssshk..', '...khsssssshk...', '....khhhhhhk....', '.....khhhhk.....', '....ktnttntk....', '...ktnnnnnntk...', '..kttnnnnnnttk..', '..kssnnnnnnssk..', '...kknnkknnkk...', '....kddkkddk....'] },
+    { ht: 0, cx: 7.5, rows: ['.....kkkkkk.....', '....khsssshk....', '...khsssssshk...', '...kssssssssk...', '...kssssssssk...', '..khsssssssshk..', '..khsssssssshk..', '...khsssssshk...', '....khhhhhhk....', '.....khhhhk.....', '....ktnttntk....', '...kgnnnnnkk....', '...kgnnnnkntk...', '....knnnnknsk...', '.....knnkkkk....', '.....knnknnk....', '.....kddk.......'] }
+  ]
+};
+// Punch animation extracted from 16x16_Attack.aseprite (Punch_Down, Punch_Down_Side, Punch_Side, Punch_Up_Side,
+// Punch_Up; 6 frames each), recoloured as the farmer. x/y/ht/cx are in the sheet's 24x24 frame coordinates.
+const PUNCH = {
+  down: [
+    { x: 5, y: 9, ht: 9, cx: 11.5, rows: ['....kkkkkk....', '...khsssshk...', '..khsssssshk..', '..kssssssssk..', '..kssssssssk..', '.khsskssksshk.', '.khsdkddkdshk.', '.kkkddddddsk..', 'ksssktttttkkk.', 'ksssknnnnksssk', 'ksssktttnksssk', '.kkkkttttksssk', '...kkntttnkkk.', '...kkkkknnnk..', '..kkkk..kdddk.'] },
+    { x: 5, y: 9, ht: 9, cx: 10.5, rows: ['...kkkkkk.....', '..khsssshk....', '.khsssssshk...', '.kssssssssk...', '.kssssssssk...', '.ksssssssshk..', '.ksksskssshk..', '.kdkddkdssk...', 'kgknttnntkkkk.', 'kggknnnnkksssk', 'kggnkttnnksssk', '.kkkktttnksssk', '..kkknttngkkk.', '...kkkkkdddk..', '..kkkk........'] },
+    { x: 4, y: 9, ht: 9, cx: 9.5, rows: ['...kkkkkk......', '..khsssshk.....', '.khsssssshk....', '.kssssssssk....', '.kssssssssk....', '.ksssssssshk...', 'kssssssssshk...', 'kskhhkksshkkkk.', 'kkhttnntnkksssk', 'kkkknnnkkkksssk', 'kkkktttnngksssk', '.kkkktttnggkkk.', '..kkkkkkksssk..', '....kkk........', '...kkk.........'] },
+    { x: 4, y: 7, ht: 7, cx: 14, rows: ['........kkkkk...', '.......khssshk..', '......khssssshk.', '......ksssssssk.', '......ksssssssk.', '.....kkkkksshsk.', '....kssssskhhsk.', '...ksssddddkddsk', '..kssssstttknssk', '.ksssssstttktsk.', 'kgsssssstttkkk..', 'kggsssggnnkkk...', '.kggggggkkkkk...', '..kkkkkkknnkk...', '....kkkkknnnnk..', '....kkkkkknnnnk.', '..........kddddk'] },
+    { x: 7, y: 8, ht: 8, cx: 13, rows: ['....kkkkk...', '...khssshk..', '..khssssshk.', '..ksssssssk.', '..kkkkksssk.', '..ksssskssk.', '.kssddddkkdk', '.kssddddkddk', '.kssttttksk.', '.kssttttkk..', '..kstttkkkk.', '..kkkkkkkkk.', '..kkkkkkkkk.', '..kkknnnnk..', '.kkkkknnnnk.', 'kkkk..kddddk'] },
+    { x: 7, y: 9, ht: 9, cx: 11.5, rows: ['..kkkkkk....', '.khsssshk...', 'khsssssshk..', 'kssssssssk..', 'kssssssssk..', 'khsskssksk..', 'kkkkkddkdk..', 'kssdkddddk..', 'ksttkttkkkk.', 'ksttknnkgggk', '.kkkttnkgggk', '..kktttkgggk', '..kkkttnkkk.', '.kkkkknnnk..', 'kkkk..kdddk.'] }
+  ],
+  downside: [
+    { x: 6, y: 9, ht: 9, cx: 11.5, rows: ['...kkkkkk...', '..khsssshk..', '.khsssssshk.', '.kssssssssk.', '.kssssssssk.', 'khssskssksk.', 'khssdkddkdsk', '.kkkkdddddsk', '.ksttktttsk.', '.ksttknnkkgk', '.ksttkttkggk', '..kkktttkkk.', '..kkntttkk..', '.knnkkkkkkk.', '.kdddk.kkkkk'] },
+    { x: 4, y: 9, ht: 9, cx: 10.5, rows: ['....kkkkkk....', '...khsssshk...', '..khsssssshk..', '..kssssssssk..', '..kssssssssk..', '.khssksskssk..', '.khsdkddkdsk..', '.kkkddddddskk.', 'ksssktttttkggk', 'kssskknnnkkggk', 'ksssktttkkkkk.', '.kkkktttkngk..', '....kknnknssk.', '....knnnkkkkk.', '...kdddk......'] },
+    { x: 2, y: 9, ht: 9, cx: 9.5, rows: ['.....kkkkkk...', '....khsssshk..', '...khsssssshk.', '...kssssssssk.', '...kssssssssk.', '...ksssssssshk', '.kkssssssssshk', 'kgkskhhkksshk.', 'kggkhttnntnk..', 'kgggkknnkkk...', '.kkk.kttknnk..', '.....kttkntsk.', '......knnkkkk.', '......knnk....', '.....kdddk....'] },
+    { x: 2, y: 8, ht: 8, cx: 14, rows: ['..........kkkkk.......', '.........khssshk......', '........khssssshk.....', '........ksssssssk.....', '........ksssssssk.....', '........kssssshsk.....', '........ksssshhsk.....', '........ksssshhsskkkk.', '........kgttttnssksssk', '.kk......knntttkkssssk', 'ksskk.....kkkkkssssssk', 'ksssskkkkktttttssssssk', 'kssssssssstttttsssssk.', '.ksssssssstttttssssk..', '..kkdddddddddddddkk...', '....kkkkkkkkkkkkk.....'] },
+    { x: 9, y: 9, ht: 9, cx: 13, rows: ['..kkkkk........', '.khssshk.......', 'khssssshk......', 'ksssssssk......', 'kssshsssk......', 'ksshhsssk......', 'ksshhkkksk.kkk.', 'kssshshhskksssk', '.knntttskkksssk', '..kknnkkkkksssk', '.kkkkkkkkkkkkk.', '.kknnnkkkkk....', 'kgnnnkkk.......', 'kdnkkkk........', 'kdk.kkkk.......'] },
+    { x: 7, y: 9, ht: 9, cx: 11.5, rows: ['..kkkkkk...', '.khsssshk..', 'khsssssshk.', 'kssssssssk.', 'kshssssssk.', 'khhssksskk.', 'khkkkkddksk', 'kkdddkdddhk', '.ktttkttsk.', '.ktttknkkk.', '..kkkttkggk', '..kktttkggk', '.knnnkkkkk.', 'knnnnkkkkk.', 'kdddk.kkkkk'] }
+  ],
+  side: [
+    { x: 7, y: 9, ht: 9, cx: 11, rows: ['..kkkkk....', '.khssshk...', 'khssssshk..', 'ksssssssk..', 'kshsssssk..', 'khhsssksk..', 'khhdddkddk.', 'khhddddddk.', '.knnkkkskgk', '..kktttkggk', '..kttttkgk.', '.kktttkkk..', '.kkkkkkk...', '.knnkkkk...', '.kddk.kkk..'] },
+    { x: 4, y: 9, ht: 9, cx: 9.5, rows: ['...kkkkkk...', '..khsssshk..', '.khsssssshk.', '.kssssssssk.', '.kssssssssk.', 'khssskssksk.', 'khssdkddkdsk', '.khsddddddsk', '.kkkkkkktsk.', 'kssttttkkk..', 'kssttttttkk.', 'kkkttttttkk.', '...kkkkkkkk.', '...knnkk.kkk', '...kdddk....'] },
+    { x: 3, y: 8, ht: 8, cx: 8, rows: ['...kkkkk....', '..khssshk...', '.khssssshk..', '.ksssssssk..', '.ksssssssk..', '.kssssssshk.', 'kskkhkksshk.', 'kshhshhssk..', '.kstttttkkk.', '.kkknnnkkssk', 'kggktttnkssk', 'kggknttngkk.', 'kkkknttkkkk.', '...kkkkk.kkk', '....knnkk...', '....kdddk...'] },
+    { x: 4, y: 10, ht: 10, cx: 11, rows: ['.....kkkkk........', '....khssshk.......', '...khssssshk......', '...ksssssssk......', '...ksshssssk......', '...kshhskkksk.....', '..kkkkkkkkkkkkkkk.', '.khssssssssssssssk', 'kgggstttttsssssssk', 'kggggtttttsssssssk', '.kgggnnnnngssssssk', '..kkkkkkkkkkkkkkk.', '....knnk..kkk.....', '....kkdk...kkk....'] },
+    { x: 9, y: 9, ht: 9, cx: 15, rows: ['....kkkkk.....', '...khssshk....', '..khssssshk...', '..ksssssssk...', '..ksssshssk...', '..kssshhsssk..', '..kssshhsssk..', '..khssshsskkk.', '...knnttkksssk', '..kgnntttssssk', 'kkkknktttssssk', 'kggkkkkkkkkkk.', 'kgggkkkk......', 'kdkk.kkk......', 'kkk...kkk.....'] },
+    { x: 7, y: 9, ht: 9, cx: 11, rows: ['..kkkkk...', '.khssshk..', 'khssssshk.', 'ksssssssk.', 'ksshssssk.', 'khhhssskk.', 'khhhsssksk', 'khhhdddddk', '.knnkkksk.', '..kktttkgk', '..kttttkgk', '..ktttkkk.', '..kkkkkk..', '..knnkkk..', '..kddk....'] }
+  ],
+  upside: [
+    { x: 8, y: 8, ht: 8, cx: 12, rows: ['..kkkkk...', '.khssshk..', 'khssssshk.', 'ksssssssk.', 'kssssshsk.', 'ksssshhsk.', 'ksssshhssk', 'khsssshssk', '.knntttkk.', '..kknnkssk', '...ktttssk', '..kttttsk.', '.knttkkk..', '.knnkkk...', 'kdnkkkkk..', 'kdddk.....'] },
+    { x: 7, y: 8, ht: 8, cx: 11, rows: ['..kkkkk...', '.khssshk..', 'khssssshk.', 'ksssssssk.', 'ksssshssk.', 'kssshhskk.', 'kssshhsksk', 'khsskkkddk', '.knktttkk.', '..kttttk..', '..kttttk..', '..kkttkkk.', '..kkkkkkk.', '.knnnk.kkk', '.kdnkk....', '.kdddk....'] },
+    { x: 2, y: 9, ht: 9, cx: 9.5, rows: ['.....kkkkkk...', '....khsssshk..', '...khsssssshk.', '...kssssssssk.', '...kssssssssk.', '..khssssssssk.', '..kkssssssssk.', '.kssksskkhhkk.', 'kssssktnntthk.', 'kssssnkkkkkk..', '.kssgnnttttk..', '..kkknnntkkkk.', '.....kkkkkkkkk', '.....knnnk....', '......kdddk...'] },
+    { x: 5, y: 7, ht: 7, cx: 11, rows: ['....kkkkk..........', '...khssshk.........', '..khssssshk........', '..ksssssssk........', '..ksshssssk........', '.kssshhssskkkkk....', '.kssshhssskhgggkk..', '.kssshssshksssgggk.', '..kktttnnksssssgggk', '...kknnkkssssssgggk', '..ksttkttssssssgggk', '.ksstkkntsssssgggk.', 'kssskkkknggggggkk..', 'ksskkkkkkkkkkkk....', '.kkkkkkkkkk........', '....knnkkkk........', '....kddk...........'] },
+    { x: 6, y: 8, ht: 8, cx: 11, rows: ['...kkkkk....', '..khssshk...', '.khssssshk..', '.ksssssssk..', '.ksshssssk..', 'kssshhssskk.', 'kssshhssskkk', 'kssshssshkkk', '.kktttnnkkkk', '..knnkkkkkkk', '..ktttkkkkk.', '.ksttkkkk...', 'ksstkkttkk..', 'ksskkknnkk..', '.kkk.knnkk..', '......kkkk..'] },
+    { x: 6, y: 8, ht: 8, cx: 12.5, rows: ['....kkkkkk...', '...khsssshk..', '..khsssssshk.', '..kssssssssk.', '..kssssssssk.', '.khsssssssshk', '.khsssssssshk', '..khsssssshk.', '...knnnnnnk..', '..kkknnnnkk..', '.kggkkkkkngk.', 'kggkttkkknggk', 'kggknnkkknggk', '.kkknnkkkkkk.', '...kkkkkk....', '.....kkkk....'] }
+  ],
+  up: [
+    { x: 5, y: 9, ht: 9, cx: 11.5, rows: ['....kkkkkk.....', '...khsssshk....', '..khsssssshk...', '..kssssssssk...', '..kssssssssk...', '.khsssssssshk..', '.khsssssssshk..', '..khsssssshk...', '..kknnnnnnkkk..', '.kggnnttttsssk.', 'kgggnntttnssssk', 'kgggnttttnssssk', '.kkkntttnngkkk.', '..kkkkkknnnk...', '.kkkkk..kdddk..'] },
+    { x: 6, y: 9, ht: 9, cx: 12.5, rows: ['....kkkkkk..', '...khsssshk.', '..khsssssshk', '..kssssssshk', '..kssssssshk', '..ksssssshhk', '..ksssssshhk', '..khsssshhhk', '..kknnnkkkkk', '.kkgnnktttk.', '.kkgnnktttk.', '.kkgntktttk.', '.kkknttkkk..', 'kkkkkkknddk.', '.......kddk.'] },
+    { x: 6, y: 9, ht: 9, cx: 12.5, rows: ['....kkkkkk...', '...khsssshk..', '..khsssssshk.', '..khsssssssk.', '..khsssssssk.', '..khshsssssk.', '..khhhsskkssk', '..khhhsshhssk', '...knnntkkkk.', '...kknkkttsk.', '..kknnkkttsk.', '..kgntkkttsk.', '.kkknttkkkk..', 'kkkkkkknddk..', '.......kddk..'] },
+    { x: 4, y: 7, ht: 7, cx: 9, rows: ['...kkkkk...........', '..khssshk..........', '.khssssshk.........', '.ksssssssk.........', '.ksssssssk.........', '.ksshsssskkkkkk....', '.ksshhssskssssskk..', 'kssshhssskssssssgk.', 'ksstntttgkssssssggk', '.kstttnnksssssssggk', '..kknnkksssssssgggk', '....kkktssssssggggk', '.....kkngsssgggggk.', '....kkkkgggggggkk..', '...kkkkkkkkkkkk....', '..kkkkk............', '.kkkkk.............'] },
+    { x: 6, y: 8, ht: 8, cx: 11, rows: ['...kkkkk....', '..khssshk...', '.khssssshk..', '.ksssssssk..', '.kssshsssk..', '.kssshhsskk.', 'kskkkhhsskkk', 'kshhshsshkkk', '.kstttnnkkkk', '.kkknnnkkkkk', 'ksstttnnkkk.', 'kssttttngk..', '.kstttttgk..', '.kkkkkkkkk..', '.kkk..knnk..', 'kkkk..kddk..'] },
+    { x: 5, y: 9, ht: 9, cx: 11.5, rows: ['....kkkkkk....', '...khsssshk...', '..khsssssshk..', '..khsssssssk..', '..khsssssssk..', '..khhssssssk..', '..khhsssssskk.', '..khhhsssshkkk', '.kggnnnnnnkkkk', 'kgggnnttttkkkk', 'kgggnntttnkkk.', '.kkknttttkk...', '....ntttnngk..', '...kkkkknnnk..', '..kkkkk.kdddk.'] }
+  ]
+};
+const PUNCH_MS = [100, 100, 200, 50, 100, 100];
+const PUNCH_TOTAL = PUNCH_MS.reduce((a, b) => a + b, 0) / 1000;
+const WALK_FRAME_MS = 100;
+const VDIR = { down: ['down', false], up: ['up', false], right: ['side', false], left: ['side', true],
+  downright: ['downside', false], downleft: ['downside', true], upright: ['upside', false], upleft: ['upside', true] };
+function buildFarmer(swap) {
+  const F = {};
+  for (const k in WALK) { F[k] = WALK[k].map(f => makeSprite(f.rows, swap)); F[k + 'L'] = F[k].map(flip); }
+  for (const k in PUNCH) { F['p_' + k] = PUNCH[k].map(f => makeSprite(f.rows, swap)); F['p_' + k + 'L'] = F['p_' + k].map(flip); }
+  return F;
+}
+function makeZSprite(rows, colors) {
+  const w = rows[0].length, h = rows.length, cv = newCanvas(w, h), c = cv.getContext('2d');
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const ch = rows[y][x];
+    if (ch === '.') continue;
+    const col = colors[ch.charCodeAt(0) - 97];
+    if (!col) continue;
+    c.fillStyle = col; c.fillRect(x, y, 1, 1);
+  }
+  return cv;
+}
+function buildZombieAnim(anim, colors) {
+  const out = {};
+  for (const k in anim) { out[k] = anim[k].map(f => makeZSprite(f.rows, colors)); out[k + 'L'] = out[k].map(flip); }
+  return out;
+}
+function buildSprites() {
+  SPR.farmer = { none: buildFarmer(null) };
+  for (const k in OUTFITS) SPR.farmer[k] = buildFarmer(OUTFITS[k].swap);
+  SPR.zwalk = {}; SPR.zattack = {};
+  for (const k of ['normal', 'guard', 'flash', 'ice']) SPR.zwalk[k] = buildZombieAnim(ZOMBIE_WALK, ZVARIANTS[k]);
+  for (const k of ['normal', 'flash', 'glow']) SPR.zattack[k] = buildZombieAnim(ZOMBIE_ATTACK, ZVARIANTS[k]);
+  SPR.zdeath = ZDEATH.map(f => makeZSprite(f.rows, ZDEATH_PAL));
+  SPR.bone = BONE_ANIM.map(f => makeZSprite(f.rows, BONE_PAL));
+  SPR.hat = {}; SPR.hatL = {};
+  for (const k in HAT_ART) { SPR.hat[k] = makeSprite(HAT_ART[k]); SPR.hatL[k] = flip(SPR.hat[k]); }
+
+  SPR.seed = makeSprite(ART.seed);
+  SPR.sprout = makeSprite(ART.sprout);
+  SPR.young = makeSprite(ART.young);
+  SPR.youngM = makeSprite(ART.young, { l: 'c', L: 'm' });
+  SPR.wither = makeSprite(ART.wither);
+  SPR.ripe = {
+    rtomato: makeSprite(ART.tomato, { l: 'y', L: 'h' }),
+    gcorn: makeSprite(ART.corn, { y: 'c', l: 'y', L: 'h' }),
+    smelon: makeSprite(ART.melon, { g: 'y', G: 'c' }),
+    mystery: SPR.youngM,
+  };
+  for (const k of COMMONS) SPR.ripe[k] = makeSprite(ART[k]);
+  SPR.bird = {}; SPR.birdL = {};
+  for (const k in BIRDS) {
+    SPR.bird[k] = [ART.crow1, ART.crow2, ART.crow3].map(a => makeSprite(a, BIRDS[k].swap));
+    SPR.birdL[k] = SPR.bird[k].map(flip);
+  }
+  SPR.tool = { hoe: makeSprite(ART.hoe), can: makeSprite(ART.can), bag: makeSprite(ART.bag), basket: makeSprite(ART.basket) };
+  SPR.toolL = {}; for (const k in SPR.tool) SPR.toolL[k] = flip(SPR.tool[k]);
+  SPR.shovel = {}; SPR.shovelL = {};
+  for (const k in SHOVELS) { SPR.shovel[k] = makeSprite(ART.shovel, SHOVELS[k].swap); SPR.shovelL[k] = flip(SPR.shovel[k]); }
+  SPR.potion = {};
+  for (const k in BOOSTS) SPR.potion[k] = makeSprite(ART.potion, { x: BOOSTS[k].col });
+  SPR.shirt = {};
+  for (const k in OUTFITS) SPR.shirt[k] = makeSprite(ART.shirt, OUTFITS[k].swap);
+  SPR.coin = makeSprite(ART.coin);
+  SPR.fence = {};
+  for (const k in FENCE_ART) SPR.fence[k] = gCanvas(FENCE_ART[k], FPAL);
+  // broken sections: rail ends snapped off around a splintered stump
+  const brk = (rows, horiz) => rows.map((r, y) => r.split('').map((ch, x) => {
+    if (horiz) return (x >= 4 && x <= 11 && !(x === 4 && y % 2) && !(x === 11 && y % 3 === 1)) ? '.' : ch;
+    return (y >= 3 && y <= 12 && !(y === 3 && x % 2) && !(y === 12 && x % 3 === 1)) ? '.' : ch;
+  }).join(''));
+  const stump = FENCE_ART.post.map((r, y) => y < 9 ? '.'.repeat(16) : r);
+  SPR.fenceBroken = { h: gCanvas(brk(FENCE_ART.h, true), FPAL), v: gCanvas(brk(FENCE_ART.vl, false), FPAL), stump: gCanvas(stump, FPAL) };
+  buildTiles();
+}
+
+// --- Tiles and buildings (drawn in code from the palette)
+function rng(seed) { let s = seed >>> 0; return () => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296); }
+function grassInto(c, seed) {
+  const r = rng(seed);
+  rr(c, 0, 0, 16, 16, 6);
+  for (let i = 0; i < 22; i++) rr(c, (r() * 16) | 0, (r() * 16) | 0, 1, 1, r() < 0.6 ? 5 : 7);
+  for (let i = 0; i < 2; i++) {
+    const x = 2 + ((r() * 11) | 0), y = 4 + ((r() * 9) | 0);
+    rr(c, x, y, 1, 2, 5); rr(c, x + 2, y, 1, 2, 5); rr(c, x + 1, y + 1, 1, 2, 5); rr(c, x + 1, y, 1, 1, 7);
+  }
+}
+function buildTiles() {
+  SPR.grass = [];
+  for (let v = 0; v < 4; v++) { const t = newCanvas(16, 16); grassInto(t.getContext('2d'), 11 + v * 97); SPR.grass.push(t); }
+
+  const soil = (wet) => {
+    const t = newCanvas(16, 16), c = t.getContext('2d');
+    grassInto(c, 5);
+    rr(c, 1, 1, 14, 14, wet ? 1 : 2);
+    rr(c, 2, 2, 12, 12, wet ? 2 : 3);
+    for (const y of [5, 10]) { rr(c, 3, y, 10, 1, wet ? 1 : 2); rr(c, 4, y - 1, 3, 1, wet ? 14 : 4); rr(c, 9, y - 1, 2, 1, wet ? 14 : 4); }
+    return t;
+  };
+  SPR.soil = soil(false); SPR.soilWet = soil(true);
+
+  const path = newCanvas(16, 16), pc = path.getContext('2d'), pr = rng(77);
+  rr(pc, 0, 0, 16, 16, 7);
+  for (let i = 0; i < 14; i++) rr(pc, (pr() * 16) | 0, (pr() * 16) | 0, 1, 1, pr() < 0.5 ? 4 : 6);
+  SPR.path = path;
+
+  const fh = newCanvas(16, 16), fc = fh.getContext('2d');
+  grassInto(fc, 31);
+  for (const y of [5, 10]) { rr(fc, 0, y, 16, 2, 4); rr(fc, 0, y + 2, 16, 1, 2); rr(fc, 0, y - 1, 16, 1, 1); }
+  for (const x of [1, 9]) { rr(fc, x, 1, 4, 14, 1); rr(fc, x + 1, 2, 2, 12, 4); rr(fc, x + 1, 2, 1, 12, 3); rr(fc, x + 1, 2, 2, 1, 7); }
+  SPR.fenceH = fh;
+
+  const fv = newCanvas(16, 16), vc = fv.getContext('2d');
+  grassInto(vc, 53);
+  rr(vc, 5, 0, 6, 16, 1); rr(vc, 6, 0, 4, 16, 4); rr(vc, 7, 0, 1, 16, 3);
+  rr(vc, 6, 4, 4, 1, 2); rr(vc, 6, 12, 4, 1, 2);
+  SPR.fenceV = fv;
+
+  const fp = newCanvas(16, 16), cc = fp.getContext('2d');
+  grassInto(cc, 71);
+  rr(cc, 4, 1, 8, 14, 1); rr(cc, 5, 2, 6, 12, 4); rr(cc, 6, 2, 1, 12, 3); rr(cc, 5, 2, 6, 1, 7);
+  SPR.fenceP = fp;
+
+  // Seed shed (48x48), weathered planks and rusty tin roof
+  const sh = newCanvas(48, 48), s = sh.getContext('2d');
+  rr(s, 3, 18, 42, 30, 1); rr(s, 4, 19, 40, 28, 4);
+  for (let x = 6; x < 44; x += 5) rr(s, x, 19, 1, 28, 3);
+  rr(s, 6, 36, 3, 8, 3); rr(s, 38, 24, 2, 9, 13);
+  rr(s, 1, 2, 46, 18, 1); rr(s, 2, 3, 44, 16, 15);
+  for (let x = 3; x < 46; x += 3) rr(s, x, 3, 1, 16, 7);
+  rr(s, 2, 3, 13, 7, 13); rr(s, 29, 11, 17, 7, 13); rr(s, 17, 13, 6, 6, 13);
+  rr(s, 2, 10, 44, 1, 2); rr(s, 35, 5, 6, 4, 1); rr(s, 36, 6, 4, 2, 2);
+  rr(s, 19, 28, 11, 19, 1); rr(s, 20, 29, 9, 18, 2); rr(s, 21, 30, 7, 17, 1);
+  rr(s, 7, 24, 8, 7, 1); rr(s, 8, 25, 6, 5, 2); rr(s, 10, 25, 1, 5, 4); rr(s, 8, 27, 6, 1, 4);
+  rr(s, 13, 20, 23, 7, 1); rr(s, 14, 21, 21, 5, 10);
+  SPR.shed = sh;
+
+  // Tool stand (48x32): striped awning, shovels on the back wall, counter
+  const st = newCanvas(48, 32), a = st.getContext('2d');
+  rr(a, 2, 6, 44, 18, 1); rr(a, 3, 7, 42, 16, 4);
+  for (let x = 6; x < 44; x += 5) rr(a, x, 7, 1, 16, 3);
+  [15, 10, 9].forEach((col, i) => {
+    const x = 9 + i * 12;
+    rr(a, x + 1, 8, 3, 8, 1); rr(a, x + 2, 9, 1, 7, 4);
+    rr(a, x - 1, 15, 7, 6, 1); rr(a, x, 16, 5, 4, col);
+  });
+  rr(a, 0, 21, 48, 11, 1); rr(a, 1, 22, 46, 9, 2); rr(a, 1, 22, 46, 2, 4);
+  rr(a, 0, 0, 48, 8, 1);
+  for (let x = 1; x < 47; x += 6) { rr(a, x, 1, 3, 6, 11); rr(a, Math.min(x + 3, 46), 1, Math.min(3, 47 - (x + 3)), 6, 16); }
+  rr(a, 12, 24, 23, 7, 1); rr(a, 13, 25, 21, 5, 10);
+  SPR.stall = st;
+
+  // Style shop (48x48): cream walls, navy roof, display window, door
+  const bq = newCanvas(48, 48), b = bq.getContext('2d');
+  rr(b, 3, 16, 42, 32, 1); rr(b, 4, 17, 40, 31, 16);
+  rr(b, 4, 17, 40, 2, 4); rr(b, 4, 17, 2, 31, 4); rr(b, 42, 17, 2, 31, 4);
+  rr(b, 1, 1, 46, 17, 1); rr(b, 2, 2, 44, 15, 14);
+  for (let y = 5; y < 17; y += 4) rr(b, 2, y, 44, 1, 15);
+  rr(b, 13, 8, 23, 7, 1); rr(b, 14, 9, 21, 5, 10);
+  for (let x = 5; x < 43; x += 4) { rr(b, x, 19, 2, 4, 10); rr(b, x + 2, 19, 2, 4, 16); }
+  rr(b, 5, 23, 38, 1, 1);
+  rr(b, 7, 26, 15, 13, 1); rr(b, 8, 27, 13, 11, 2);
+  rr(b, 10, 29, 6, 3, 11); rr(b, 9, 31, 8, 1, 11);
+  rr(b, 12, 33, 6, 4, 7); rr(b, 11, 33, 1, 2, 7); rr(b, 18, 33, 1, 2, 7);
+  rr(b, 26, 27, 13, 21, 1); rr(b, 27, 28, 11, 20, 4); rr(b, 29, 30, 7, 7, 14); rr(b, 35, 39, 1, 2, 10);
+  SPR.boutique = bq;
+
+  // Tool rack (32x16): shovels leaning on the fence
+  const rk = newCanvas(32, 16), k = rk.getContext('2d');
+  rr(k, 0, 5, 32, 2, 2);
+  for (let i = 0; i < 3; i++) {
+    const x = 3 + i * 10;
+    rr(k, x + 1, 0, 3, 10, 1); rr(k, x + 2, 1, 1, 9, 4);
+    rr(k, x - 1, 9, 7, 7, 1); rr(k, x, 10, 5, 5, i === 1 ? 13 : 15); rr(k, x, 10, 1, 4, 16);
+  }
+  SPR.rack = rk;
+
+  // Barrel (16x16)
+  const br = newCanvas(16, 16), bb = br.getContext('2d');
+  rr(bb, 2, 1, 12, 15, 1); rr(bb, 3, 2, 10, 13, 4); rr(bb, 4, 2, 2, 13, 3);
+  rr(bb, 3, 4, 10, 1, 15); rr(bb, 3, 11, 10, 1, 15); rr(bb, 4, 2, 8, 1, 2);
+  SPR.barrel = br;
+}
+
+/* =========================================================
+   SAVE DATA
+   ========================================================= */
+let SAVE = { best: 0, hats: [], hat: null, outfits: [], outfit: null, volume: 0.7, music: true, muted: false, diff: 'normal' };
+function loadSave() {
+  try { const s = JSON.parse(localStorage.getItem(SAVE_KEY)); if (s) SAVE = Object.assign(SAVE, s); } catch (e) {}
+  if (!Array.isArray(SAVE.hats)) SAVE.hats = [];
+  if (!Array.isArray(SAVE.outfits)) SAVE.outfits = [];
+}
+function writeSave() {
+  try { localStorage.setItem(SAVE_KEY, JSON.stringify(SAVE)); } catch (e) {}
+}
+
+/* =========================================================
+   AUDIO (Web Audio, generated)
+   ========================================================= */
+let AC = null, master = null, muted = false, musicNext = 0, musicStep = 0;
+function initAudio() {
+  if (AC) { if (AC.state === 'suspended') AC.resume(); return; }
+  try {
+    AC = new (window.AudioContext || window.webkitAudioContext)();
+    master = AC.createGain(); master.connect(AC.destination); applyAudio();
+    musicNext = AC.currentTime + 0.1;
+  } catch (e) { AC = null; }
+}
+function toneAt(f, t, d, type = 'square', v = 0.12, slide = 0) {
+  if (!AC || muted) return;
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = type; o.frequency.setValueAtTime(f, t);
+  if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(30, f + slide), t + d);
+  g.gain.setValueAtTime(v, t); g.gain.exponentialRampToValueAtTime(0.001, t + d);
+  o.connect(g); g.connect(master); o.start(t); o.stop(t + d + 0.02);
+}
+function tone(f, d, type, v, slide = 0, delay = 0) { if (AC) toneAt(f, AC.currentTime + delay, d, type, v, slide); }
+let noiseBuf = null;
+function noise(d, v = 0.15, freq = 800, delay = 0) {
+  if (!AC || muted) return;
+  if (!noiseBuf) {
+    noiseBuf = AC.createBuffer(1, AC.sampleRate, AC.sampleRate);
+    const ch = noiseBuf.getChannelData(0);
+    for (let i = 0; i < ch.length; i++) ch[i] = Math.random() * 2 - 1;
+  }
+  const t = AC.currentTime + delay;
+  const src = AC.createBufferSource(), f = AC.createBiquadFilter(), g = AC.createGain();
+  src.buffer = noiseBuf; f.type = 'bandpass'; f.frequency.value = freq;
+  g.gain.setValueAtTime(v, t); g.gain.exponentialRampToValueAtTime(0.001, t + d);
+  src.connect(f); f.connect(g); g.connect(master); src.start(t); src.stop(t + d + 0.02);
+}
+const SFX = {
+  till()    { noise(0.09, 0.25, 400); tone(110, 0.06, 'square', 0.06, -40); },
+  plant()   { tone(520, 0.06, 'square', 0.1); tone(780, 0.08, 'square', 0.1, 0, 0.05); },
+  water()   { noise(0.3, 0.12, 2200); },
+  harvest() { [523, 659, 784].forEach((f, i) => tone(f, 0.09, 'square', 0.11, 0, i * 0.06)); },
+  coin()    { tone(988, 0.05, 'square', 0.1); tone(1319, 0.14, 'square', 0.1, 0, 0.05); },
+  select()  { tone(660, 0.04, 'square', 0.06); },
+  error()   { tone(150, 0.16, 'square', 0.1, -50); },
+  crow()    { tone(760, 0.14, 'sawtooth', 0.06, -380); },
+  scare()   { tone(280, 0.12, 'square', 0.1, 500); noise(0.12, 0.12, 2500); },
+  eaten()   { noise(0.22, 0.16, 600); tone(220, 0.22, 'square', 0.08, -120); },
+  rare()    { [523, 659, 784, 1047, 1319].forEach((f, i) => tone(f, 0.13, 'square', 0.11, 0, i * 0.07)); },
+  day()     { [392, 523, 659, 784].forEach((f, i) => tone(f, 0.14, 'triangle', 0.16, 0, i * 0.1)); },
+  over()    { [392, 330, 262, 196].forEach((f, i) => tone(f, 0.28, 'triangle', 0.18, 0, i * 0.22)); },
+  hit()     { noise(0.08, 0.28, 900); tone(170, 0.08, 'square', 0.1, -60); },
+  groan()   { tone(110, 0.5, 'sawtooth', 0.04, -30); tone(88, 0.5, 'triangle', 0.06, -20, 0.05); },
+  zdie()    { noise(0.3, 0.2, 300); [220, 165, 110].forEach((f, i) => tone(f, 0.12, 'square', 0.09, 0, i * 0.08)); },
+  hurt()    { tone(320, 0.15, 'square', 0.12, -220); noise(0.1, 0.15, 1200); },
+  tired()   { [330, 262, 196].forEach((f, i) => tone(f, 0.14, 'triangle', 0.14, 0, i * 0.09)); },
+  guard()   { [330, 440, 554, 659].forEach((f, i) => tone(f, 0.1, 'triangle', 0.14, 0, i * 0.06)); },
+  alarm()   { [880, 660, 880, 660].forEach((f, i) => tone(f, 0.09, 'square', 0.08, 0, i * 0.1)); },
+  poison()  { tone(400, 0.4, 'sawtooth', 0.07, -250); noise(0.3, 0.1, 500, 0.05); },
+  thud()    { noise(0.12, 0.3, 250); tone(90, 0.12, 'square', 0.09, -30); },
+  crash()   { noise(0.45, 0.35, 350); noise(0.25, 0.2, 1400, 0.05); [180, 120, 80].forEach((f, i) => tone(f, 0.12, 'square', 0.1, -40, i * 0.06)); },
+  whoosh()  { noise(0.07, 0.12, 3000); },
+};
+// Short chiptune loop
+const MELODY = [72,0,76,79, 77,76,74,0, 72,74,76,72, 74,0,67,0, 72,0,76,79, 81,79,77,76, 74,76,74,71, 72,0,0,0];
+const BASS   = [48,0,55,0, 53,0,55,0, 48,0,55,0, 55,0,50,0, 48,0,55,0, 53,0,57,0, 55,0,55,0, 48,0,48,0];
+const midi = n => 440 * Math.pow(2, (n - 69) / 12);
+function tickMusic() {
+  if (!AC || muted || !SAVE.music) return;
+  if (musicNext < AC.currentTime) musicNext = AC.currentTime + 0.05;
+  while (musicNext < AC.currentTime + 0.2) {
+    const i = musicStep % MELODY.length;
+    if (MELODY[i]) toneAt(midi(MELODY[i]), musicNext, 0.22, 'square', 0.028);
+    if (BASS[i]) toneAt(midi(BASS[i]), musicNext, 0.4, 'triangle', 0.07);
+    musicNext += 0.2727; musicStep++;
+  }
+}
+function applyAudio() {
+  muted = SAVE.muted || SAVE.volume <= 0;
+  if (master) master.gain.value = muted ? 0 : SAVE.volume * 0.7;
+}
+function toggleMute() { SAVE.muted = !SAVE.muted; applyAudio(); writeSave(); }
+/* =========================================================
+   INPUT (keyboard + touch share the same actions)
+   ========================================================= */
+const keysHeld = new Set(), vHeld = new Set(), pressed = new Set();
+const KEYMAP = {
+  ArrowUp: 'up', KeyW: 'up', ArrowDown: 'down', KeyS: 'down', ArrowLeft: 'left', KeyA: 'left',
+  ArrowRight: 'right', KeyD: 'right', Space: 'a', KeyZ: 'a', KeyJ: 'a', Enter: 'a',
+  KeyE: 'b', KeyX: 'b', KeyK: 'b', KeyQ: 'prev', KeyP: 'pause', Escape: 'pause', KeyM: 'mute',
+  Digit1: 's1', Digit2: 's2', Digit3: 's3', Digit4: 's4', Digit5: 's5',
+};
+const held = k => keysHeld.has(k) || vHeld.has(k);
+window.addEventListener('keydown', e => {
+  if (e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
+  initAudio();
+  const k = KEYMAP[e.code];
+  if (!k) return;
+  e.preventDefault();
+  if (!keysHeld.has(k)) pressed.add(k);
+  keysHeld.add(k);
+});
+window.addEventListener('keyup', e => { const k = KEYMAP[e.code]; if (k) keysHeld.delete(k); });
+window.addEventListener('blur', () => { keysHeld.clear(); vHeld.clear(); });
+
+const touchEl = document.getElementById('touch');
+const isTouch = ('ontouchstart' in window) || (window.matchMedia && window.matchMedia('(pointer:coarse)').matches);
+if (isTouch) touchEl.classList.add('on');
+touchEl.querySelectorAll('button').forEach(btn => {
+  const k = btn.dataset.k;
+  const up = () => { vHeld.delete(k); btn.classList.remove('down'); };
+  btn.addEventListener('pointerdown', e => {
+    e.preventDefault(); initAudio(); try { window.focus(); } catch (err) {}
+    if (!vHeld.has(k)) pressed.add(k);
+    vHeld.add(k); btn.classList.add('down');
+    try { btn.setPointerCapture(e.pointerId); } catch (err) {}
+  });
+  btn.addEventListener('pointerup', up);
+  btn.addEventListener('pointercancel', up);
+  btn.addEventListener('lostpointercapture', up);
+});
+// --- Mouse / tap: left click = move, farm, harvest, shop. Right click = attack.
+const mouse = { x: 0, y: 0, in: false, moved: false, right: false, hoverT: 0 };
+const clicks = [];
+let wheelQ = 0;
+function toCanvas(e) {
+  const r = cvs.getBoundingClientRect();
+  return { x: (e.clientX - r.left) / r.width * W, y: (e.clientY - r.top) / r.height * H };
+}
+cvs.addEventListener('contextmenu', e => e.preventDefault());
+cvs.addEventListener('pointermove', e => {
+  const p = toCanvas(e); mouse.x = p.x; mouse.y = p.y; mouse.in = true; mouse.moved = true;
+  if (e.pointerType === 'mouse') mouse.hoverT = 3;
+});
+cvs.addEventListener('pointerleave', () => { mouse.in = false; });
+function grabFocus() { try { window.focus(); cvs.focus({ preventScroll: true }); } catch (err) {} }
+cvs.addEventListener('pointerdown', e => {
+  if (e.pointerType !== 'mouse') e.preventDefault();
+  grabFocus(); initAudio();
+  const p = toCanvas(e); mouse.x = p.x; mouse.y = p.y;
+  if (e.button === 2) mouse.right = true;
+  if (e.button === 0 || e.button === 2) clicks.push({ x: p.x, y: p.y, btn: e.button });
+});
+window.addEventListener('pointerup', e => { if (e.button === 2) mouse.right = false; });
+cvs.addEventListener('wheel', e => { e.preventDefault(); wheelQ += Math.sign(e.deltaY); }, { passive: false });
+
+
+/* =========================================================
+   ENTITIES & WORLD
+   ========================================================= */
+let mode = 'title';
+let S = null;           // run state
+let titleMap = null;
+let frameT = 0, shakeT = 0, shakeMag = 0;
+const SOLID = { fence: 1, shed: 1, stall: 1, boutique: 1, rack: 1, barrel: 1 };
+const DIRS = { up: [0, -1], down: [0, 1], left: [-1, 0], right: [1, 0] };
+
+function buildMap() {
+  const g = [];
+  for (let r = 0; r < ROWS; r++) {
+    g.push([]);
+    for (let c = 0; c < COLS; c++) {
+      const edge = r === 0 || r === ROWS - 1 || c === 0 || c === COLS - 1;
+      g[r].push({ type: edge ? 'fence' : 'grass', crop: null, wet: false, v: (r * 7 + c * 13) % 4 });
+    }
+  }
+  for (const k in BUILDINGS) {
+    const b = BUILDINGS[k];
+    for (let r = b.r; r < b.r + b.h; r++) for (let c = b.c; c < b.c + b.w; c++) g[r][c].type = k;
+  }
+  for (let c = 25; c <= 28; c++) { g[4][c].type = 'path'; g[10][c].type = 'path'; }   // paths to the shop doors
+  for (let r = 6; r <= 7; r++) g[r][4].type = 'path';
+  g[1][1].type = 'rack'; g[1][2].type = 'rack';
+  g[ROWS - 2][1].type = 'barrel';
+  // decorative darker grass patches (from the ground tileset)
+  for (const [c0, r0, w, h] of [[1, 9, 4, 4], [5, 1, 3, 2], [12, 12, 4, 2], [21, 1, 4, 2], [22, 12, 3, 2], [25, 6, 3, 3]])
+    for (let r = r0; r < r0 + h; r++) for (let c = c0; c < c0 + w; c++) if (g[r][c].type === 'grass') g[r][c].dark = true;
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) if (g[r][c].type === 'fence') g[r][c].fhp = FENCE_HP();
+  return g;
+}
+function buildTitleMap() {
+  const m = buildMap(), kinds = ['corn', 'strawberry', 'tomato', 'pumpkin', 'carrot', 'grape', 'wheat', 'watermelon'];
+  for (let r = 2; r <= 4; r++) for (let c = 7; c <= 22; c++) {
+    const t = m[r][c]; t.type = 'soil';
+    const kind = kinds[(r * 3 + c) % kinds.length];
+    t.crop = { kind, stage: (c % 4 === 0) ? 2 : 3, prog: 0, ripeT: 0, withered: false, result: kind };
+  }
+  return m;
+}
+const tileAt = (c, r) => (S && r >= 0 && c >= 0 && r < ROWS && c < COLS) ? S.map[r][c] : null;
+
+function newGame() {
+  S = {
+    gold: START_GOLD, score: 0, day: 1, time: DAY_LEN, rares: 0, kills: 0, paid: 0,
+    seeds: Object.fromEntries(SEED_ORDER.map(k => [k, 0])), sel: 0,
+    shovels: [], shovel: null, shovelUses: {}, boosts: {},
+    map: buildMap(),
+    player: { x: 15 * TILE + 8, y: 8 * TILE + 10, dir: 'down', vdir: 'down', moving: false, animT: 0, actT: 0, tool: null,
+      stam: STAMINA_MAX, tired: false, stamDelay: 0,
+      kbx: 0, kby: 0, stun: 0, hurtCD: 0, flash: 0, goal: null },
+    crows: [], zombies: [], corpses: [], bones: [], debris: [], parts: [], pops: [], crowT: 9, zombieT: 25,
+    threat: 0, seen: {}, clickFx: null,
+    shop: 'seed', shopIdx: 0, shopScroll: 0, msg: '', msgT: 0,
+    overReason: '', overSub: '', newBest: false,
+  };
+  S.seeds.wheat = 3;
+  toast('TIP: SEEDS AT THE SHED, SHOVELS ON THE LEFT');
+}
+function newCrop(kind) { return { kind, stage: 0, prog: 0, ripeT: 0, withered: false, result: null, targeted: false }; }
+function pick(a) { return a[(Math.random() * a.length) | 0]; }
+function pickRare() { const r = Math.random(); return r < 0.5 ? 'rtomato' : r < 0.85 ? 'gcorn' : 'smelon'; }
+
+// --- FX helpers (map coordinates)
+function toast(m) { S.msg = m; S.msgT = 2.6; }
+function shake(t, m) { shakeT = Math.max(shakeT, t); shakeMag = Math.max(shakeMag, m); }
+function popup(x, y, txt, col) { S.pops.push({ x, y, txt, col, life: 1.2 }); }
+function burst(x, y, cols, n, spd = 40, g = 90) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, v = spd * (0.4 + Math.random() * 0.8);
+    S.parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - spd * 0.5, g, life: 0.4 + Math.random() * 0.5, col: pick(cols) });
+  }
+}
+const tcx = c => c * TILE + 8, tcy = r => r * TILE + 9;
+
+/* =========================================================
+   GAME STATES / UPDATE
+   ========================================================= */
+function update(dt) {
+  frameT += dt;
+  if (pressed.has('mute')) toggleMute();
+  tickMusic();
+  handleClicks();
+  switch (mode) {
+    case 'title':
+      if (pressed.has('a')) { initAudio(); newGame(); mode = 'play'; SFX.coin(); }
+      else if (pressed.has('pause')) openMenu('title');
+      break;
+    case 'play': updatePlay(dt); break;
+    case 'menu': updateMenu(); break;
+    case 'shop': updateShop(); break;
+    case 'dayend':
+      if (pressed.has('a')) {
+        S.day++; S.time = DAY_LEN; S.crows = []; S.zombies = []; S.crowT = 8; S.zombieT = 20; mode = 'play'; SFX.coin();
+        S.threat = threatLevel(); S.player.goal = null; S.debris = [];
+        for (const row of S.map) for (const t of row) if (t.type === 'fence') { t.broken = false; t.fhp = t.fmax = FENCE_HP(); }
+        toast('DAY ' + S.day + ': THREAT STARTS AT ' + S.threat + '. KEEP YOUR SHOVEL READY');
+      }
+      break;
+    case 'over': case 'win':
+      if (pressed.has('a')) mode = 'title';
+      break;
+  }
+  mouse.moved = false; wheelQ = 0;
+  if (S && mode !== 'menu') updateFx(dt);
+  if (shakeT > 0) { shakeT -= dt; if (shakeT <= 0) shakeMag = 0; }
+}
+
+function solidAt(px, py) {
+  const c = Math.floor(px / TILE), r = Math.floor(py / TILE);
+  if (c < 0 || r < 0 || c >= COLS || r >= ROWS) return true;
+  return !!SOLID[S.map[r][c].type];
+}
+function boxHits(x, y) { return solidAt(x - 4, y - 4) || solidAt(x + 3, y - 4) || solidAt(x - 4, y + 1) || solidAt(x + 3, y + 1); }
+function targetTile() {
+  const P = S.player, d = DIRS[P.dir];
+  return { c: Math.floor((P.x + d[0] * 11) / TILE), r: Math.floor((P.y - 3 + d[1] * 11) / TILE) };
+}
+function frontPoint() { const P = S.player, d = DIRS[P.dir]; return { x: P.x + d[0] * 10, y: P.y - 5 + d[1] * 10 }; }
+function zombieInFront() {
+  const f = frontPoint(); let best = null, bd = 15;
+  for (const z of S.zombies) {
+    if (z.guard || z.dead) continue;
+    const d = Math.hypot(z.x - f.x, (z.y - 6) - f.y);
+    if (d < bd) { bd = d; best = z; }
+  }
+  return best;
+}
+function cycleSeed(n) {
+  const have = SEED_ORDER.some(k => S.seeds[k] > 0);
+  let i = S.sel;
+  for (let j = 0; j < SEED_ORDER.length; j++) {
+    i = (i + n + SEED_ORDER.length) % SEED_ORDER.length;
+    if (!have || S.seeds[SEED_ORDER[i]] > 0) break;
+  }
+  S.sel = i; SFX.select();
+}
+function tryMove(P, mx, my) {
+  if (!boxHits(P.x + mx, P.y)) P.x += mx;
+  if (!boxHits(P.x, P.y + my)) P.y += my;
+}
+
+function updatePlay(dt) {
+  if (pressed.has('pause')) { openMenu('play'); return; }
+  const P = S.player;
+  if (pressed.has('b')) cycleSeed(1);
+  if (pressed.has('prev')) cycleSeed(-1);
+  for (let i = 1; i <= 5; i++) if (pressed.has('s' + i)) { S.sel = i - 1; SFX.select(); }
+
+  // Knockback from zombie hits
+  P.hurtCD -= dt; P.flash -= dt;
+  if (P.kbx || P.kby) {
+    tryMove(P, P.kbx * dt, P.kby * dt);
+    const f = Math.pow(0.002, dt); P.kbx *= f; P.kby *= f;
+    if (Math.abs(P.kbx) < 2 && Math.abs(P.kby) < 2) P.kbx = P.kby = 0;
+  }
+
+  // Stamina regenerates; when exhausted the farmer stays slow until the bar is full again
+  if (P.stamDelay > 0) P.stamDelay -= dt;
+  else if (P.stam < STAMINA_MAX) {
+    P.stam = Math.min(STAMINA_MAX, P.stam + (P.tired ? STAMINA_REGEN_TIRED : STAMINA_REGEN) * dt);
+    if (P.tired && P.stam >= STAMINA_MAX) { P.tired = false; popup(P.x, P.y - 26, 'RESTED!', 9); SFX.select(); }
+  }
+
+  if (P.punchT > 0) { P.punchT -= dt; P.punchAnim += dt; }
+
+  // Movement: keyboard overrides click-to-move
+  let dx = (held('right') ? 1 : 0) - (held('left') ? 1 : 0);
+  let dy = (held('down') ? 1 : 0) - (held('up') ? 1 : 0);
+  if (dx || dy) P.goal = null;
+  if (P.actT > 0) { P.actT -= dt; dx = dy = 0; }
+  if (P.stun > 0) { P.stun -= dt; dx = dy = 0; }
+  P.moving = false;
+  if (dx || dy) {
+    const horiz = dx > 0 ? 'right' : 'left', vert = dy > 0 ? 'down' : 'up';
+    if (dx && !dy) P.dir = horiz;
+    else if (dy && !dx) P.dir = vert;
+    else if (P.dir !== horiz && P.dir !== vert) P.dir = horiz;
+    if (dx && dy) { dx *= 0.7071; dy *= 0.7071; }
+    P.vdir = dx && dy ? (dy > 0 ? 'down' : 'up') + (dx > 0 ? 'right' : 'left') : P.dir;
+    const sp = speedNow() * dt;
+    tryMove(P, dx * sp, dy * sp);
+    P.moving = true; P.animT += dt * (P.tired ? TIRED_SPEED : 1);
+  } else if (P.goal && P.actT <= 0 && P.stun <= 0) followGoal(dt);
+
+  if (pressed.has('a') && P.actT <= 0 && P.stun <= 0) { P.goal = null; doAction(true); }
+
+  // Threat rises every 30 seconds
+  const th = threatLevel();
+  if (th > S.threat) { S.threat = th; announceThreat(th); }
+
+  // Crops
+  const growMul = S.boosts.grow ? 1.5 : 1;
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    const t = S.map[r][c], crop = t.crop;
+    if (!crop || crop.withered) continue;
+    if (crop.stage < 3) {
+      crop.prog += dt * growMul * (t.wet ? 2 : 1) / (CROPS[crop.kind].grow / 3);
+      if (crop.prog >= 1) {
+        crop.prog = 0; crop.stage++; t.wet = false;
+        if (crop.stage === 3) ripen(crop, c, r);
+      }
+    } else {
+      crop.ripeT += dt;
+      if (crop.result && CROPS[crop.result].rare && Math.random() < dt * 5) burst(tcx(c), tcy(r) - 4, [10, 16], 1, 12, -10);
+      if (crop.ripeT >= ROT_TIME) { crop.withered = true; popup(tcx(c), tcy(r) - 8, 'ROTTED', 13); toast('A CROP ROTTED - HARVEST SOONER!'); SFX.eaten(); }
+    }
+  }
+
+  updateCrows(dt);
+  updateZombies(dt);
+  updateCorpses(dt);
+
+  // Bankrupt check: no gold for seeds, no seeds, nothing growing
+  const seedCount = SEED_ORDER.reduce((a, k) => a + S.seeds[k], 0);
+  if (S.gold < CROPS.wheat.cost && seedCount === 0) {
+    let alive = false;
+    for (const row of S.map) for (const t of row) if (t.crop && !t.crop.withered) alive = true;
+    if (!alive) { gameOver('BANKRUPT!', 'NO GOLD, NO SEEDS, NO CROPS'); return; }
+  }
+
+  S.time -= dt;
+  if (S.time <= 0) endDay();
+}
+
+function openShop(which) {
+  S.shop = which; S.shopIdx = 0; S.shopScroll = 0; mode = 'shop'; S.player.actT = 0; SFX.select();
+}
+function doAction(allowAttack) {
+  const P = S.player;
+  P.actT = 0.22; P.tool = null;
+  if (allowAttack) { const z = zombieInFront(); if (z) { attack(z); return; } }
+  const { c, r } = targetTile(), t = tileAt(c, r);
+  if (!t) return;
+  const x = tcx(c), y = tcy(r);
+  if (t.type === 'shed') { openShop('seed'); return; }
+  if (t.type === 'stall') { openShop('tool'); return; }
+  if (t.type === 'boutique') { openShop('style'); return; }
+  if (t.type !== 'grass' && t.type !== 'soil') { SFX.error(); toast("YOU CAN'T FARM HERE"); P.actT = 0.1; return; }
+  if (t.type === 'grass') {
+    t.type = 'soil'; t.wet = false; P.tool = 'hoe';
+    SFX.till(); burst(x, y, [3, 2, 6], 8, 30);
+    return;
+  }
+  const crop = t.crop;
+  if (!crop) {
+    if (t.poison) { SFX.error(); toast('POISONED SOIL - NO PLANTING HERE UNTIL TOMORROW'); P.actT = 0.1; return; }
+    const k = SEED_ORDER[S.sel];
+    if (S.seeds[k] > 0) {
+      S.seeds[k]--; t.crop = newCrop(k); P.tool = 'bag';
+      SFX.plant(); burst(x, y, [9, 3], 6, 25);
+    } else {
+      SFX.error(); toast('NO ' + CROPS[k].name + ' SEEDS - BUY AT THE SHED'); P.actT = 0.1;
+    }
+    return;
+  }
+  if (crop.withered) { t.crop = null; P.tool = 'hoe'; SFX.till(); burst(x, y, [2, 3], 8, 30); return; }
+  if (crop.stage >= 3) { harvest(t, c, r); P.tool = 'basket'; return; }
+  P.tool = 'can';
+  if (!t.wet) { t.wet = true; SFX.water(); burst(x, y - 4, [14, 16, 15], 10, 30, 120); popup(x, y - 10, 'X2 GROWTH', 16); }
+  else toast('ALREADY WATERED - WAIT FOR IT TO GROW');
+}
+
+// --- Click-to-move, pathfinding and mouse actions
+function speedNow() { return SPEED * (S.boosts.speed ? 1.4 : 1) * (S.player.tired ? TIRED_SPEED : 1); }
+function faceToward(x, y) {
+  const P = S.player, dx = x - P.x, dy = y - (P.y - 5);
+  P.dir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 'right' : 'left') : (dy > 0 ? 'down' : 'up');
+  P.vdir = P.dir;
+}
+function swing() {
+  const P = S.player, z = zombieInFront();
+  if (z) { attack(z); return; }
+  P.tool = 'shovel'; P.actT = 0.2; SFX.whoosh(); useStamina(); startPunch(); useShovel();
+}
+function startPunch() {        // rapid hits keep the current punch playing instead of restarting it every time
+  const P = S.player;
+  if (P.punchT > 0.2) return;
+  P.punchT = PUNCH_TOTAL; P.punchAnim = 0;
+}
+// Each swing (hit or miss) wears the shovel down; at 0 it breaks and the farmer is back to fists
+function useShovel() {
+  if (!S.shovel) return;
+  const id = S.shovel, P = S.player;
+  S.shovelUses[id] = (S.shovelUses[id] || 0) - 1;
+  if (S.shovelUses[id] <= 0) {
+    delete S.shovelUses[id];
+    S.shovels = S.shovels.filter(k => k !== id);
+    S.shovel = null;
+    popup(P.x, P.y - 30, 'SHOVEL BROKE!', 11); SFX.error(); shake(0.2, 1);
+    burst(P.x, P.y - 8, [15, 4, 1], 12, 40);
+    toast(SHOVELS[id].name + ' BROKE - BACK TO FISTS');
+  }
+}
+function useStamina() {
+  const P = S.player;
+  P.stamDelay = STAMINA_DELAY;
+  if (P.tired) return;
+  P.stam = Math.max(0, P.stam - diff().stam);
+  if (P.stam <= 0) {
+    P.tired = true; popup(P.x, P.y - 26, 'EXHAUSTED!', 11); SFX.tired();
+    toast('OUT OF STAMINA - YOU MOVE SLOWLY UNTIL IT REFILLS');
+  }
+}
+function walkable(c, r) { return c >= 0 && r >= 0 && c < COLS && r < ROWS && !SOLID[S.map[r][c].type]; }
+// BFS over the tile grid; returns waypoints ending at the exact destination point
+function findPath(px, py, dest) {
+  const sc = Math.floor(px / TILE), sr = Math.floor((py - 2) / TILE);
+  const gc = Math.floor(dest.x / TILE), gr = Math.floor((dest.y - 2) / TILE);
+  if (!walkable(gc, gr)) return null;
+  const key = (c, r) => r * COLS + c, prev = new Map([[key(sc, sr), -1]]), q = [[sc, sr]];
+  while (q.length) {
+    const [c, r] = q.shift();
+    if (c === gc && r === gr) break;
+    for (const [ox, oy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const nc = c + ox, nr = r + oy, k = key(nc, nr);
+      if (!walkable(nc, nr) || prev.has(k)) continue;
+      prev.set(k, key(c, r)); q.push([nc, nr]);
+    }
+  }
+  if (!prev.has(key(gc, gr))) return null;
+  const tiles = [];
+  for (let k = key(gc, gr); k !== -1; k = prev.get(k)) tiles.unshift(k);
+  const pts = tiles.slice(1, -1).map(k => ({ x: tcx(k % COLS), y: Math.floor(k / COLS) * TILE + 10 }));
+  if (tiles.length > 1) pts.unshift({ x: tcx(sc), y: sr * TILE + 10 });
+  pts.push({ x: dest.x, y: dest.y });
+  return pts;
+}
+function approachPoints(c, r) {
+  const cx = tcx(c), cy = tcy(r);
+  return [{ x: cx, y: cy + 16, dir: 'up' }, { x: cx, y: cy - 11, dir: 'down' },
+          { x: cx - 13, y: cy + 3, dir: 'right' }, { x: cx + 13, y: cy + 3, dir: 'left' }];
+}
+function setTileGoal(c, r) {
+  const P = S.player;
+  let best = null;
+  for (const a of approachPoints(c, r)) {
+    if (boxHits(a.x, a.y)) continue;
+    const path = findPath(P.x, P.y, a);
+    if (!path) continue;
+    const len = path.length + Math.hypot(a.x - P.x, a.y - P.y) / 64;
+    if (!best || len < best.len) best = { a, path, len };
+  }
+  if (!best) { SFX.error(); toast("CAN'T REACH THAT SPOT"); return; }
+  P.goal = { kind: 'tile', c, r, dir: best.a.dir, path: best.path, t: 0 };
+}
+function walkTo(P, tx, ty, dt) {
+  const dx = tx - P.x, dy = ty - P.y, d = Math.hypot(dx, dy);
+  if (d < 0.5) return d;
+  const step = Math.min(speedNow() * dt, d), ox = P.x, oy = P.y;
+  tryMove(P, dx / d * step, dy / d * step);
+  P.dir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 'right' : 'left') : (dy > 0 ? 'down' : 'up');
+  const ax = Math.abs(dx), ay = Math.abs(dy);
+  P.vdir = (ax > ay * 2 || ay > ax * 2) ? P.dir : (dy > 0 ? 'down' : 'up') + (dx > 0 ? 'right' : 'left');
+  P.moving = true; P.animT += dt * (P.tired ? TIRED_SPEED : 1);
+  if (Math.hypot(P.x - ox, P.y - oy) < step * 0.2) P.goal.stuck = (P.goal.stuck || 0) + dt; else P.goal.stuck = 0;
+  return Math.hypot(tx - P.x, ty - P.y);
+}
+function followGoal(dt) {
+  const P = S.player, g = P.goal;
+  g.t += dt;
+  if (g.t > 12 || (g.stuck || 0) > 0.6) { P.goal = null; return; }
+  if (g.kind === 'attack') {
+    const z = g.z;
+    if (z.dead || z.guard) { P.goal = null; return; }
+    if (Math.hypot(z.x - P.x, z.y - P.y) < 13) {
+      faceToward(z.x, z.y - 6); swing();
+      if (!mouse.right || z.dead || z.guard) P.goal = null;
+    } else walkTo(P, z.x, z.y, dt);
+    return;
+  }
+  if (g.path && g.path.length) {
+    const wp = g.path[0];
+    if (walkTo(P, wp.x, wp.y, dt) < 1.5) g.path.shift();
+    if (g.path.length) return;
+  }
+  P.goal = null;
+  if (g.kind === 'tile') { P.dir = P.vdir = g.dir; doAction(false); }
+}
+function playClick(ck) {
+  const P = S.player;
+  if (ck.y < MAP_Y) { if (ck.x >= SEED_BOX.x && ck.x < SEED_BOX.x + SEED_BOX.w) cycleSeed(ck.btn === 2 ? -1 : 1); return; }
+  const mx = ck.x, my = ck.y - MAP_Y;
+  S.clickFx = { x: mx, y: my, life: 0.4, col: ck.btn === 2 ? 11 : 16 };
+  if (ck.btn === 2) {                                   // right click: attack
+    let z = null, bd = 13;
+    for (const e of S.zombies) if (!e.guard && !e.dead) { const d = Math.hypot(e.x - mx, (e.y - 7) - my); if (d < bd) { bd = d; z = e; } }
+    if (z) P.goal = { kind: 'attack', z, t: 0 };
+    else if (P.actT <= 0 && P.stun <= 0) { P.goal = null; faceToward(mx, my); swing(); }
+    return;
+  }
+  const bone = S.bones.find(b => Math.hypot(b.x - mx, (b.y - 4) - my) < 10);   // click a bone to go grab it
+  if (bone) { const path = findPath(P.x, P.y, { x: bone.x, y: bone.y }); if (path) { P.goal = { kind: 'walk', path, t: 0 }; return; } }
+  const c = Math.floor(mx / TILE), r = Math.floor(my / TILE), t = tileAt(c, r);
+  if (!t) return;
+  let tc = c, tr = r;
+  if (BUILDINGS[t.type]) [tc, tr] = BUILDINGS[t.type].door;
+  const tt = S.map[tr][tc].type;
+  const near = Math.hypot(tcx(c) - P.x, tcy(r) - (P.y - 3)) < 26;
+  if (tt === 'soil' || tt === 'shed' || tt === 'stall' || tt === 'boutique' || (tt === 'grass' && near)) setTileGoal(tc, tr);
+  else if (!SOLID[tt]) {                              // far grass or path: just walk there
+    const path = findPath(P.x, P.y, { x: tcx(c), y: r * TILE + 10 });
+    if (path) P.goal = { kind: 'walk', path, t: 0 };
+  }
+}
+const SHOP_BOX = { x: (W - 236) >> 1, y: (H - 146) >> 1, w: 236, h: 146 };
+const SEED_BOX = { x: 246, y: 4, w: 22, h: 22 };
+const MENU_BTN = { x: W - 22, y: 6, w: 18, h: 18 };
+function shopRowAt(x, y) {
+  const b = SHOP_BOX;
+  if (x < b.x + 4 || x > b.x + b.w - 4) return -1;
+  const row = Math.floor((y - (b.y + 18)) / 11);
+  if (row < 0 || row >= SHOP_ROWS) return -1;
+  const idx = S.shopScroll + row;
+  return idx < SHOPS[S.shop].items.length ? idx : -1;
+}
+function shopClick(ck) {
+  const b = SHOP_BOX;
+  if (ck.btn === 2 || ck.x < b.x || ck.x > b.x + b.w || ck.y < b.y || ck.y > b.y + b.h) { mode = 'play'; return; }
+  const idx = shopRowAt(ck.x, ck.y);
+  if (idx >= 0) { S.shopIdx = idx; buy(SHOPS[S.shop].items[idx]); }
+}
+function handleClicks() {
+  if (mouse.hoverT > 0) mouse.hoverT -= STEP;
+  for (const ck of clicks) {
+    const mb = MENU_BTN;
+    if ((mode === 'title' || mode === 'play') && ck.x >= mb.x && ck.x < mb.x + mb.w && ck.y >= mb.y && ck.y < mb.y + mb.h) { openMenu(mode); continue; }
+    if (mode === 'title' || mode === 'dayend' || mode === 'over' || mode === 'win') { if (ck.btn === 0) pressed.add('a'); }
+    else if (mode === 'menu') menuClick(ck);
+    else if (mode === 'shop') shopClick(ck);
+    else if (mode === 'play') playClick(ck);
+  }
+  clicks.length = 0;
+}
+
+// --- Threat: every 30s more enemies, and new bird types join
+function threatLevel() { return (S.day - 1) + Math.floor((DAY_LEN - Math.max(0, S.time)) / THREAT_EVERY); }
+function announceThreat(th) {
+  SFX.alarm(); shake(0.2, 1);
+  let msg = 'THREAT ' + th + ': MORE ENEMIES INCOMING!';
+  for (const k in BIRDS) if (BIRDS[k].unlock && th >= BIRDS[k].unlock && !S.seen[k]) {
+    S.seen[k] = true;
+    msg = k === 'red' ? 'RED BIRDS! THEY EAT A CROP IN 3 SECONDS' : 'PINK BIRDS! THEY POISON SOIL FOR THE WHOLE DAY';
+  }
+  toast(msg);
+}
+function pickBirdType() {
+  const opts = [['crow', 4]];
+  if (S.threat >= BIRDS.red.unlock) opts.push(['red', 1 + S.threat * 0.8]);
+  if (S.threat >= BIRDS.pink.unlock) opts.push(['pink', 0.6 + S.threat * 0.4]);
+  let r = Math.random() * opts.reduce((a, o) => a + o[1], 0);
+  for (const o of opts) { r -= o[1]; if (r <= 0) return o[0]; }
+  return 'crow';
+}
+
+function ripen(crop, c, r) {
+  const x = tcx(c), y = tcy(r), lucky = !!S.boosts.luck;
+  if (crop.kind === 'mystery') {
+    const roll = Math.random();
+    if (roll < (lucky ? 0.30 : 0.40)) { crop.withered = true; popup(x, y - 8, 'DUD!', 11); SFX.error(); return; }
+    crop.result = roll < (lucky ? 0.62 : 0.82) ? pick(COMMONS) : pickRare();
+  } else {
+    crop.result = Math.random() < (lucky ? 0.12 : 0.04) ? pickRare() : crop.kind;
+  }
+  if (CROPS[crop.result].rare) {
+    popup(x, y - 10, 'RARE!', 10); SFX.rare(); shake(0.35, 2);
+    burst(x, y - 4, [10, 16], 18, 50);
+    toast(CROPS[crop.result].name + ' APPEARED!');
+  }
+}
+
+function harvest(t, c, r) {
+  const crop = t.crop, def = CROPS[crop.result], x = tcx(c), y = tcy(r);
+  const val = Math.round(def.sell * (S.boosts.sell ? 1.25 : 1));
+  S.gold += val; S.score += val;
+  if (def.rare) { S.rares++; shake(0.25, 2); burst(x, y, [10, 16], 20, 60); }
+  t.crop = null;
+  popup(x, y - 10, '+' + val + 'G', 10);
+  burst(x, y - 2, [9, 8, 10, 11], 10, 45);
+  SFX.harvest();
+}
+
+// --- Crows: fly in and peck growing crops unless you (or a guardian) shoo them
+function updateCrows(dt) {
+  S.crowT -= dt;
+  if (S.crowT <= 0) {
+    S.crowT = (Math.max(1.8, 9 - S.threat * 0.9) + Math.random() * 2) * diff().spawn;
+    const targets = [];
+    for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+      const cr = S.map[r][c].crop;
+      if (cr && !cr.withered && cr.stage >= 1 && !cr.targeted) targets.push({ c, r, crop: cr });
+    }
+    if (targets.length && S.crows.filter(k => k.state !== 'flee').length < Math.min(8, 1 + S.threat)) {
+      const tg = pick(targets), left = Math.random() < 0.5;
+      tg.crop.targeted = true;
+      S.crows.push({ type: pickBirdType(), x: left ? -12 : COLS * TILE + 12, y: 10 + Math.random() * (ROWS * TILE - 20), state: 'fly',
+        tc: tg.c, tr: tg.r, crop: tg.crop, peckT: 0, t: 0, vx: 0, vy: 0, flash: 0 });
+      SFX.crow();
+    }
+  }
+  const P = S.player;
+  for (const k of S.crows) {
+    k.t += dt; k.flash -= dt;
+    const tile = S.map[k.tr][k.tc];
+    const lost = !tile || tile.crop !== k.crop || k.crop.withered;
+    if (k.state !== 'flee' && lost) flee(k, false);
+    if (k.state === 'fly') {
+      const tx = tcx(k.tc), ty = tcy(k.tr) + 2, ddx = tx - k.x, ddy = ty - k.y, d = Math.hypot(ddx, ddy);
+      k.vx = ddx;
+      if (d < 2) { k.state = 'peck'; k.x = tx; k.y = ty; SFX.crow(); }
+      else { const sp = BIRDS[k.type].speed; k.x += ddx / d * sp * dt; k.y += ddy / d * sp * dt; }
+    } else if (k.state === 'peck') {
+      k.peckT += dt;
+      if (Math.random() < dt * 6) burst(k.x, k.y - 2, [9, 8], 1, 20);
+      const B = BIRDS[k.type];
+      if (k.peckT >= B.eat * diff().eat) {
+        if (B.poison) {
+          tile.crop = null; tile.poison = true; tile.wet = false;
+          popup(k.x, k.y - 12, 'POISONED!', 17); SFX.poison(); burst(k.x, k.y, [17, 14], 14, 35);
+          toast('POISONED SOIL: NO PLANTING THERE TODAY');
+        } else { k.crop.withered = true; popup(k.x, k.y - 12, 'EATEN!', 11); SFX.eaten(); }
+        shake(0.2, 1);
+        flee(k, false);
+      }
+    } else {
+      k.x += k.vx * dt; k.y += k.vy * dt;
+    }
+    if (k.state !== 'flee' && Math.hypot(P.x - k.x, (P.y - 6) - k.y) < 18) {
+      flee(k, true);
+      const rw = BIRDS[k.type].reward;
+      S.gold += rw; S.score += rw * 2; k.flash = 0.2;
+      popup(k.x, k.y - 12, 'SHOO! +' + rw + 'G', 16);
+      burst(k.x, k.y - 2, [1, 15], 10, 50, 40);
+      SFX.scare(); shake(0.12, 1);
+    }
+  }
+  S.crows = S.crows.filter(k => k.x > -40 && k.x < COLS * TILE + 40 && k.y > -60);
+}
+function flee(k, scared) {
+  if (k.crop) k.crop.targeted = false;
+  k.state = 'flee';
+  k.vx = (k.x < COLS * TILE / 2 ? -1 : 1) * (scared ? 110 : 80);
+  k.vy = -60;
+}
+
+// --- Zombies: shamble slowly to the nearest crop and eat it; bump the farmer to steal gold
+// Zombies arrive at a fence section (bottom, left or right) and must smash through it unless it's already broken
+function spawnZombie() {
+  const roll = Math.random();
+  let c, r, x, y, vdir;
+  if (roll < 0.55) { c = 2 + ((Math.random() * (COLS - 4)) | 0); r = ROWS - 1; x = tcx(c); y = ROWS * TILE - 3; vdir = 'up'; }
+  else if (roll < 0.8) { c = 0; r = pick([2, 3, 4, 8, 9, 10, 11, 12]); x = 7; y = tcy(r) + 4; vdir = 'right'; }
+  else { c = COLS - 1; r = pick([5, 6, 7, 8, 9]); x = COLS * TILE - 7; y = tcy(r) + 4; vdir = 'left'; }
+  const tile = S.map[r][c];
+  S.zombies.push({ x, y, hp: diff().zhp, maxHp: diff().zhp, t: Math.random() * 5, eatT: 0, target: null, flash: 0, frozen: 0,
+    kx: 0, ky: 0, guard: false, life: 0, atkT: 0, dir: 1, vdir, atkAnim: 0, moving: false, dead: false,
+    breach: tile.broken ? null : { c, r }, bashT: 1.2, lunge: 0 });
+  SFX.groan();
+}
+function hitFence(z, c, r) {
+  const t = S.map[r][c];
+  if (t.fhp == null) t.fhp = t.fmax = FENCE_HP();
+  t.fhp--; t.shake = 0.25; z.lunge = 0.18;
+  const x = tcx(c), y = r * TILE + 6;
+  SFX.thud(); burst(x, y, [4, 2, 13], 5, 30);
+  if (t.fhp <= 0) breakFence(t, c, r);
+}
+function breakFence(t, c, r) {
+  const piece = SPR.fence[fencePiece(c, r)], x0 = c * TILE, y0 = r * TILE;
+  t.broken = true; t.fhp = 0;
+  // the section crashes: four chunks of the fence fly apart, plus splinters and dust
+  for (let q = 0; q < 4; q++) {
+    const qx = (q % 2) * 8, qy = (q >> 1) * 8, a = Math.random() * Math.PI * 2;
+    S.debris.push({ img: piece, sx: qx, sy: qy, w: 8, h: 8, x: x0 + qx, y: y0 + qy + 4, z: 4,
+      vx: Math.cos(a) * 45 + (qx ? 15 : -15), vy: Math.sin(a) * 20 - (r === 0 ? -20 : 20), vz: 70 + Math.random() * 50, life: 1.4 });
+  }
+  const wood = ['#ffa14f', '#db7d48', '#b45b45', '#83393f', '#5a2d3b'];
+  for (let i = 0; i < 16; i++) {
+    const a = Math.random() * Math.PI * 2, v = 30 + Math.random() * 60;
+    S.debris.push({ col: pick(wood), w: 1 + (Math.random() * 2 | 0), h: 1, x: x0 + 8, y: y0 + 8, z: 6,
+      vx: Math.cos(a) * v, vy: Math.sin(a) * v * 0.5, vz: 50 + Math.random() * 80, life: 0.8 + Math.random() * 0.6 });
+  }
+  burst(x0 + 8, y0 + 10, [7, 15, 16], 14, 50, 40);
+  popup(x0 + 8, y0 - 2, 'CRASH!', 11);
+  SFX.crash(); shake(0.35, 2);
+  toast('A ZOMBIE SMASHED THROUGH THE FENCE! IT GETS FIXED AT DAWN');
+}
+function nearestCrop(z) {
+  let best = null, bd = 1e9;
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    const cr = S.map[r][c].crop;
+    if (!cr || cr.withered) continue;
+    const d = Math.hypot(tcx(c) - z.x, tcy(r) - z.y);
+    if (d < bd) { bd = d; best = { c, r, crop: cr }; }
+  }
+  return best;
+}
+function stepToward(z, tx, ty, sp, dt) {
+  const dx = tx - z.x, dy = ty - z.y, d = Math.hypot(dx, dy);
+  if (d < 0.5) { z.moving = false; return d; }
+  z.x += dx / d * sp * dt; z.y += dy / d * sp * dt; z.moving = true;
+  const ax = Math.abs(dx), ay = Math.abs(dy), h = dx > 0 ? 'right' : 'left', v = dy > 0 ? 'down' : 'up';
+  z.vdir = ax > ay * 2 ? h : ay > ax * 2 ? v : v + h;     // 8 directions, same as the sheet + mirroring
+  return d;
+}
+function updateZombies(dt) {
+  if (S.time < DAY_LEN - 15) S.zombieT -= dt;     // short grace period each morning
+  if (S.zombieT <= 0) {
+    S.zombieT = (Math.max(6, 24 - S.threat * 2.2) + Math.random() * 5) * diff().spawn;
+    if (S.zombies.filter(z => !z.guard).length < Math.min(8, 1 + Math.ceil(S.threat * 0.7))) spawnZombie();
+  }
+  const P = S.player;
+  for (const z of S.zombies) {
+    if (z.dead) continue;
+    z.t += dt; z.flash -= dt;
+    if (z.kx || z.ky) {
+      z.x += z.kx * dt; z.y += z.ky * dt;
+      const f = Math.pow(0.003, dt); z.kx *= f; z.ky *= f;
+      if (Math.abs(z.kx) < 1 && Math.abs(z.ky) < 1) z.kx = z.ky = 0;
+    }
+    z.x = Math.max(-10, Math.min(COLS * TILE + 10, z.x));
+    z.y = Math.max(-6, Math.min(ROWS * TILE + 10, z.y));
+    if (z.guard) { updateGuardian(z, dt); continue; }
+    if (z.frozen > 0) { z.frozen -= dt; z.moving = false; continue; }
+    if (z.lunge > 0) z.lunge -= dt;
+    if (z.breach) {                                       // bashing the fence
+      const ft = S.map[z.breach.r][z.breach.c];
+      if (ft.broken) z.breach = null;
+      else {
+        z.moving = false; z.bashT -= dt;
+        if (z.bashT <= 0) { z.bashT = 1.1; hitFence(z, z.breach.c, z.breach.r); }
+        if (P.hurtCD <= 0 && Math.hypot(P.x - z.x, P.y - z.y) < 10) hurtPlayer(z);
+        continue;
+      }
+    }
+
+    if (!z.target || z.target.crop.withered || S.map[z.target.r][z.target.c].crop !== z.target.crop) {
+      z.target = nearestCrop(z); z.eatT = 0;
+    }
+    if (z.target) {
+      const d = Math.hypot(tcx(z.target.c) - z.x, tcy(z.target.r) + 3 - z.y);
+      if (d < 3) {
+        z.moving = false; z.eatT += dt; z.atkAnim += dt;
+        if (Math.random() < dt * 5) burst(z.x, z.y - 4, [9, 8], 1, 20);
+        if (z.eatT >= 3.5) {
+          z.target.crop.withered = true;
+          popup(z.x, z.y - 20, 'EATEN!', 11); SFX.eaten(); shake(0.15, 1);
+          z.target = null; z.eatT = 0;
+        }
+      } else stepToward(z, tcx(z.target.c), tcy(z.target.r) + 3, ZOMBIE_SPEED, dt);
+    } else stepToward(z, P.x, P.y, ZOMBIE_SPEED, dt);
+
+    if (P.hurtCD <= 0 && Math.hypot(P.x - z.x, P.y - z.y) < 10) hurtPlayer(z);
+    if (Math.random() < dt * 0.06) SFX.groan();
+  }
+  S.zombies = S.zombies.filter(z => !z.dead);
+}
+function hurtPlayer(z) {
+  const P = S.player;
+  P.hurtCD = 1.2; P.stun = 0.35; P.flash = 0.6;
+  const a = Math.atan2(P.y - z.y, P.x - z.x);
+  P.kbx = Math.cos(a) * 130; P.kby = Math.sin(a) * 130;
+  const lost = Math.min(3, S.gold); S.gold -= lost;
+  popup(P.x, P.y - 22, lost ? '-' + lost + 'G' : 'OUCH!', 11);
+  SFX.hurt(); shake(0.25, 2);
+}
+function attack(z) {
+  const P = S.player, sh = weapon(), d = DIRS[P.dir];
+  P.tool = 'shovel'; P.actT = 0.25; useStamina(); startPunch();
+  z.hp -= sh.dmg; z.flash = 0.15;
+  const kb = sh.kb || 60; z.kx = d[0] * kb; z.ky = d[1] * kb;
+  if (sh.freeze) { z.frozen = sh.freeze; burst(z.x, z.y - 6, [16, 15], 10, 30, 40); }
+  SFX.hit(); shake(0.1, 1); burst(z.x, z.y - 6, [6, 5, 11], 6, 40);
+  if (z.hp <= 0) killZombie(z);
+  useShovel();
+}
+// --- Death animation and bone drops
+function spawnCorpse(z, bone) { S.corpses.push({ x: z.x, y: z.y, t: 0, bone, dropped: false }); }
+function dropBone(x, y) {
+  const cands = [[x, y], [x + 12, y], [x - 12, y], [x, y + 10], [x, y - 10]];
+  let spot = cands.find(([bx, by]) => bx > TILE && bx < (COLS - 1) * TILE && by > TILE && by < (ROWS - 1) * TILE && !boxHits(bx, by));
+  if (!spot) spot = [S.player.x, S.player.y];
+  S.bones.push({ x: spot[0], y: spot[1], t: 0, life: BONE_LIFE });
+  popup(spot[0], spot[1] - 18, 'BONE!', 16); SFX.select();
+}
+function updateCorpses(dt) {
+  for (const c of S.corpses) {
+    c.t += dt;
+    // the bone pops out as the body collapses
+    if (c.bone && !c.dropped && c.t >= 0.5) { c.dropped = true; dropBone(c.x + (c.x >= S.player.x ? 12 : -12), c.y + 2); }   // lands away from the farmer
+  }
+  S.corpses = S.corpses.filter(c => c.t < ZDEATH_TOTAL + CORPSE_FADE);
+  const P = S.player;
+  for (const b of S.bones) {
+    b.t += dt; b.life -= dt;
+    if (Math.hypot(P.x - b.x, P.y - b.y) < 11) {
+      b.gone = true; S.gold += BONE_GOLD; S.score += BONE_GOLD;
+      popup(b.x, b.y - 18, '+' + BONE_GOLD + 'G', 10); SFX.coin(); burst(b.x, b.y - 4, [16, 10], 12, 40);
+    } else if (b.life <= 0) { b.gone = true; burst(b.x, b.y - 3, [15, 16], 6, 20); }
+  }
+  S.bones = S.bones.filter(b => !b.gone);
+}
+function killZombie(z) {
+  S.gold += 4; S.score += 6; S.kills++;
+  popup(z.x, z.y - 20, '+4G', 10);
+  burst(z.x, z.y - 6, [6, 5, 15, 1], 18, 55);
+  SFX.zdie(); shake(0.2, 2);
+  if (weapon().guard) {
+    z.guard = true; z.life = 40; z.hp = ZOMBIE_HP; z.target = null; z.frozen = 0; z.kx = z.ky = 0;
+    popup(z.x, z.y - 28, 'GUARDIAN!', 9); SFX.guard(); burst(z.x, z.y - 6, [9, 10], 14, 40);
+  } else { z.dead = true; spawnCorpse(z, Math.random() < BONE_CHANCE); }
+}
+// Guardians (Necro shovel): chase off crows and fight zombies, then crumble
+function updateGuardian(z, dt) {
+  const P = S.player;
+  z.life -= dt;
+  if (z.life <= 0) { z.dead = true; spawnCorpse(z, false); popup(z.x, z.y - 20, 'RESTS', 7); return; }
+  let best = null, bd = 150;
+  for (const e of S.zombies) if (!e.guard && !e.dead) { const d = Math.hypot(e.x - z.x, e.y - z.y); if (d < bd) { bd = d; best = e; } }
+  for (const k of S.crows) if (k.state !== 'flee') { const d = Math.hypot(k.x - z.x, k.y - z.y); if (d < bd) { bd = d; best = k; } }
+  if (!best) {
+    if (Math.hypot(P.x - z.x, P.y - z.y) > 26) stepToward(z, P.x, P.y, 24, dt); else z.moving = false;
+    return;
+  }
+  if (bd < 12) {
+    z.moving = false; z.atkT -= dt;
+    if (z.atkT <= 0) {
+      z.atkT = 0.8;
+      if (best.hp !== undefined) {
+        best.hp--; best.flash = 0.15; SFX.hit(); burst(best.x, best.y - 6, [6, 5], 5, 30);
+        if (best.hp <= 0) killZombie(best);
+      } else {
+        flee(best, true); popup(best.x, best.y - 12, 'SHOO!', 9); SFX.scare();
+      }
+    }
+  } else stepToward(z, best.x, best.y, 26, dt);
+}
+
+// --- Shops
+function itemInfo(it) {
+  const o = { icon: null, name: '', cost: 0, owned: false, afford: true, right: '', rightCol: 7, desc: '' };
+  if (it.kind === 'seed') {
+    const d = CROPS[it.id];
+    o.icon = SPR.ripe[it.id]; o.name = d.name + ' SEED'; o.cost = d.cost; o.right = 'HAVE ' + S.seeds[it.id];
+    o.desc = it.id === 'mystery' ? 'RISKY: DUD, COMMON CROP OR RARE (UP TO 200G)'
+      : (d.fruit ? 'FRUIT. ' : '') + 'GROWS ' + d.grow + 'S - SELLS ' + d.sell + 'G - 4% RARE';
+  } else if (it.kind === 'shovel') {
+    const d = SHOVELS[it.id];
+    o.icon = SPR.shovel[it.id]; o.name = d.name; o.cost = d.cost; o.owned = S.shovels.includes(it.id);
+    const uses = S.shovelUses[it.id] || 0;
+    o.right = S.shovel === it.id ? 'ON ' + uses + '/' + SHOVEL_USES : o.owned ? 'OWN ' + uses + '/' + SHOVEL_USES : d.rarity;
+    o.rightCol = (o.owned) ? 16 : d.rc;
+    o.desc = o.owned ? (S.shovel === it.id ? 'A: PUT AWAY (USE FISTS)' : 'A: EQUIP') + ' - ' + uses + ' USES LEFT'
+      : d.rarity + ': ' + d.desc + ' (' + SHOVEL_USES + ' USES)';
+  } else if (it.kind === 'hat') {
+    const d = HATS[it.id];
+    o.icon = SPR.hat[it.id]; o.name = d.name; o.cost = d.cost; o.owned = SAVE.hats.includes(it.id);
+    o.right = o.owned ? (SAVE.hat === it.id ? 'WEARING' : 'OWNED') : 'CLOTHES';
+    o.desc = o.owned ? 'A: WEAR OR TAKE OFF' : 'CLOTHES ARE YOURS FOREVER, EVEN AFTER GAME OVER';
+  } else if (it.kind === 'outfit') {
+    const d = OUTFITS[it.id];
+    o.icon = SPR.shirt[it.id]; o.name = d.name; o.cost = d.cost; o.owned = SAVE.outfits.includes(it.id);
+    o.right = o.owned ? (SAVE.outfit === it.id ? 'WEARING' : 'OWNED') : 'CLOTHES';
+    o.desc = o.owned ? 'A: WEAR OR TAKE OFF' : 'CLOTHES ARE YOURS FOREVER, EVEN AFTER GAME OVER';
+  } else {
+    const d = BOOSTS[it.id];
+    o.icon = SPR.potion[it.id]; o.name = d.name; o.cost = d.cost; o.owned = !!S.boosts[it.id];
+    o.right = o.owned ? 'ACTIVE' : 'BOOST'; o.rightCol = o.owned ? 9 : 7;
+    o.desc = o.owned ? 'ACTIVE UNTIL THE END OF TODAY' : d.desc;
+  }
+  o.afford = o.owned || S.gold >= o.cost;
+  return o;
+}
+function buy(it) {
+  const info = itemInfo(it);
+  if (it.kind === 'seed') {
+    if (S.gold >= info.cost) { S.gold -= info.cost; S.seeds[it.id]++; S.sel = SEED_ORDER.indexOf(it.id); SFX.coin(); } else SFX.error();
+  } else if (it.kind === 'shovel') {
+    if (info.owned) { S.shovel = S.shovel === it.id ? null : it.id; SFX.select(); }
+    else if (S.gold >= info.cost) { S.gold -= info.cost; S.shovels.push(it.id); S.shovelUses[it.id] = SHOVEL_USES; S.shovel = it.id; SFX.rare(); }
+    else SFX.error();
+  } else if (it.kind === 'hat' || it.kind === 'outfit') {
+    const list = it.kind === 'hat' ? SAVE.hats : SAVE.outfits, key = it.kind === 'hat' ? 'hat' : 'outfit';
+    if (info.owned) { SAVE[key] = SAVE[key] === it.id ? null : it.id; SFX.select(); writeSave(); }
+    else if (S.gold >= info.cost) { S.gold -= info.cost; list.push(it.id); SAVE[key] = it.id; writeSave(); SFX.rare(); }
+    else SFX.error();
+  } else {
+    if (info.owned) SFX.error();
+    else if (S.gold >= info.cost) { S.gold -= info.cost; S.boosts[it.id] = true; SFX.coin(); }
+    else SFX.error();
+  }
+}
+function updateShop() {
+  const items = SHOPS[S.shop].items, n = items.length;
+  if (wheelQ) {
+    S.shopScroll = Math.max(0, Math.min(Math.max(0, n - SHOP_ROWS), S.shopScroll + wheelQ));
+    S.shopIdx = Math.max(S.shopScroll, Math.min(S.shopScroll + SHOP_ROWS - 1, S.shopIdx));
+  }
+  if (mouse.moved) { const i = shopRowAt(mouse.x, mouse.y); if (i >= 0) S.shopIdx = i; }
+  if (pressed.has('up')) { S.shopIdx = (S.shopIdx + n - 1) % n; SFX.select(); }
+  if (pressed.has('down')) { S.shopIdx = (S.shopIdx + 1) % n; SFX.select(); }
+  if (S.shopIdx < S.shopScroll) S.shopScroll = S.shopIdx;
+  if (S.shopIdx >= S.shopScroll + SHOP_ROWS) S.shopScroll = S.shopIdx - SHOP_ROWS + 1;
+  if (pressed.has('b') || pressed.has('pause')) { mode = 'play'; return; }
+  if (pressed.has('a')) buy(items[S.shopIdx]);
+}
+
+function endDay() {
+  for (const row of S.map) for (const t of row) { t.poison = false; if (t.crop) t.crop.targeted = false; }
+  S.crows = []; S.zombies = []; S.corpses = []; S.bones = []; S.boosts = {}; S.player.goal = null;
+  const rent = rentFor(S.day);
+  if (S.gold >= rent) {
+    S.gold -= rent; S.paid = rent;
+    if (S.day >= MAX_DAYS) { finishRun(); mode = 'win'; SFX.rare(); }
+    else { mode = 'dayend'; SFX.day(); }
+  } else {
+    gameOver('EVICTED!', "COULDN'T PAY " + rent + 'G RENT');
+  }
+}
+function finishRun() {
+  S.newBest = S.score > SAVE.best;
+  if (S.newBest) { SAVE.best = S.score; writeSave(); }
+}
+function gameOver(reason, sub) {
+  S.overReason = reason; S.overSub = sub;
+  finishRun(); mode = 'over'; SFX.over(); shake(0.5, 3);
+}
+
+function updateFx(dt) {
+  for (const p of S.parts) { p.x += p.vx * dt; p.y += p.vy * dt; p.vy += p.g * dt; p.life -= dt; }
+  S.parts = S.parts.filter(p => p.life > 0);
+  for (const p of S.pops) { p.y -= 14 * dt; p.life -= dt; }
+  for (const d of S.debris) {           // tumbling fence chunks with a little bounce
+    d.x += d.vx * dt; d.y += d.vy * dt; d.vz -= 260 * dt; d.z += d.vz * dt; d.life -= dt;
+    if (d.z < 0) { d.z = 0; d.vz = -d.vz * 0.35; d.vx *= 0.6; d.vy *= 0.6; }
+  }
+  S.debris = S.debris.filter(d => d.life > 0);
+  for (const row of S.map) for (const t of row) if (t.shake > 0) t.shake -= dt;
+  S.pops = S.pops.filter(p => p.life > 0);
+  if (S.msgT > 0) S.msgT -= dt;
+  if (S.clickFx) S.clickFx.life -= dt;
+}
+
+/* =========================================================
+   RENDERING
+   ========================================================= */
+let GMAP = null;    // map currently being drawn (the run's map or the title-screen map)
+const isSandT = t => t && (t.type === 'soil' || t.type === 'path' || !!BUILDINGS[t.type]);
+function nb(c, r) { return (r >= 0 && c >= 0 && r < ROWS && c < COLS) ? GMAP[r][c] : null; }
+function fencePiece(c, r) {
+  const top = r === 0, bot = r === ROWS - 1, left = c === 0, right = c === COLS - 1;
+  if (top && left) return 'tl'; if (top && right) return 'tr';
+  if (bot && left) return 'bl'; if (bot && right) return 'br';
+  if (top || bot) return c % 4 === 0 ? 'cross' : 'h';
+  if (r % 4 === 0) return 'vtop';
+  return left ? 'vl' : 'vr';
+}
+function drawGround(t, c, r, x, y) {
+  const sandAt = (dx, dy) => isSandT(nb(c + dx, r + dy));
+  if (isSandT(t)) {
+    const soil = t.type === 'soil', wet = soil && t.wet;
+    let key = 'S', fv = 0;
+    for (const [dx, dy] of [[-1, -1], [0, -1], [1, -1], [-1, 0], [1, 0], [-1, 1], [0, 1], [1, 1]]) key += sandAt(dx, dy) ? 1 : 0;
+    if (soil) {
+      const L = (nb(c - 1, r) || {}).type === 'soil', Rt = (nb(c + 1, r) || {}).type === 'soil';
+      fv = L && Rt ? 1 : Rt ? 0 : L ? 2 : 3;          // furrow: left cap, middle, right cap, single
+      key += 'F' + fv + (wet ? 'W' : '');
+    }
+    ctx.drawImage(groundTile(key, () => {
+      const rows = autoRows(GROUND.sand, sandAt);
+      if (!soil) return rows;
+      const fur = wet ? GROUND.fwet : GROUND.fdry;
+      for (let yy = 0; yy < 16; yy++) for (let xx = 0; xx < 16; xx++) {
+        let ch = rows[yy][xx];
+        const sand = ch === G_SAND, fc = fur[yy][fv * 16 + xx];
+        if (wet && G_WET[ch]) ch = G_WET[ch];
+        if (sand && G_BAR.includes(fc)) ch = fc;
+        rows[yy][xx] = ch;
+      }
+      return rows;
+    }), x, y);
+  } else if (t.dark) {
+    const darkAt = (dx, dy) => { const n = nb(c + dx, r + dy); return !n || (!!n.dark && !isSandT(n)); };
+    let key = 'D';
+    for (const [dx, dy] of [[-1, -1], [0, -1], [1, -1], [-1, 0], [1, 0], [-1, 1], [0, 1], [1, 1]]) key += darkAt(dx, dy) ? 1 : 0;
+    ctx.drawImage(groundTile(key, () => autoRows(GROUND.dark, darkAt)), x, y);
+  } else {
+    ctx.drawImage(groundTile('G', () => GROUND.sand.slice(16, 32).map(row => row.slice(32, 48))), x, y);   // plain grass
+  }
+}
+function drawTile(t, c, r) {
+  const x = c * TILE, y = r * TILE + MAP_Y;
+  drawGround(t, c, r, x, y);
+  if (t.type === 'fence') drawFence(t, c, r, x, y);
+  else if (t.type === 'barrel') ctx.drawImage(SPR.barrel, x, y);
+  if (t.poison) {
+    R(x + 3, y + 4, 2, 2, 17); R(x + 9, y + 3, 3, 2, 17); R(x + 5, y + 9, 3, 2, 17); R(x + 11, y + 10, 2, 2, 17);
+    R(x + 7, y + 6, 2, 1, 14); R(x + 4, y + 12, 2, 1, 14);
+    const b = Math.floor((frameT * 6 + c * 5) % 12);
+    R(x + 4 + (c * 3) % 8, y + 13 - b, 1, 1, 17);
+  }
+}
+function drawFence(t, c, r, x, y) {
+  const piece = fencePiece(c, r), horiz = r === 0 || r === ROWS - 1;
+  if (t.broken) {
+    ctx.drawImage(horiz ? SPR.fenceBroken.h : SPR.fenceBroken.v, x, y);
+    ctx.drawImage(SPR.fenceBroken.stump, horiz ? x : x, y);
+    return;
+  }
+  let sx = 0;
+  if (t.shake > 0) sx = Math.round(Math.sin(frameT * 70) * 1.5);
+  ctx.drawImage(SPR.fence[piece], x + sx, y);
+  // cracks grow with damage
+  const dmg = (t.fmax || FENCE_HP()) - (t.fhp == null ? FENCE_HP() : t.fhp);
+  if (dmg > 0) {
+    ctx.fillStyle = '#2a1418';
+    const cx = x + sx + (horiz ? 7 : 6), cy = y + (horiz ? 5 : 7);
+    ctx.fillRect(cx, cy, 1, 2); ctx.fillRect(cx + 1, cy + 2, 1, 1);
+    if (dmg > 1) { ctx.fillRect(cx - 3, cy + 1, 1, 2); ctx.fillRect(cx + 3, cy - 1, 1, 2); ctx.fillRect(cx + 2, cy + 3, 1, 1); }
+    if (dmg > 2) { ctx.fillRect(cx - 4, cy - 1, 2, 1); ctx.fillRect(cx + 4, cy + 2, 1, 2); }
+  }
+}
+function cropSprite(crop) {
+  if (crop.withered) return SPR.wither;
+  if (crop.stage === 0) return SPR.seed;
+  if (crop.stage === 1) return SPR.sprout;
+  if (crop.stage === 2) return crop.kind === 'mystery' ? SPR.youngM : SPR.young;
+  return SPR.ripe[crop.result || crop.kind];
+}
+function drawCrop(t, c, r, live) {
+  const crop = t.crop, img = cropSprite(crop);
+  let x = c * TILE + ((TILE - img.width) >> 1), y = r * TILE + MAP_Y + 14 - img.height;
+  if (live && (crop.targeted && S.crows.some(k => k.crop === crop && k.state === 'peck')
+    || S.zombies.some(z => z.target && z.target.crop === crop && z.eatT > 0))) x += Math.round(Math.sin(frameT * 40));
+  if (crop.stage === 3 && !crop.withered) y += Math.round(Math.sin(frameT * 3 + c) * 0.6);
+  ctx.drawImage(img, x, y);
+  if (live && crop.stage === 3 && !crop.withered && ROT_TIME - crop.ripeT < 8 && Math.floor(frameT * 4) % 2) {
+    text('!', c * TILE + 7, r * TILE + MAP_Y - 2, 11);
+  }
+}
+// Draws a 16x17 walk-cycle frame. x = left edge, fy = feet row. Hats follow the head of each frame.
+function drawFarmerAt(F, vdir, frame, x, fy, alpha, scale = 1) {
+  const [key, fl] = VDIR[vdir] || VDIR.down, meta = WALK[key][frame];
+  const img = F[fl ? key + 'L' : key][frame], top = fy - 16 * scale;
+  ctx.globalAlpha = alpha;
+  ctx.drawImage(img, x, top, 16 * scale, 17 * scale);
+  if (SAVE.hat && SPR.hat[SAVE.hat]) {
+    const cx = fl ? 15 - meta.cx : meta.cx, hat = fl ? SPR.hatL[SAVE.hat] : SPR.hat[SAVE.hat];
+    ctx.drawImage(hat, x + Math.round((cx - 5.5) * scale), top + (meta.ht - 1) * scale, hat.width * scale, hat.height * scale);
+  }
+  ctx.globalAlpha = 1;
+}
+// Punch frames come from the same 24x24 sheet canvas as the walk cycle; ox/oy is that canvas's top-left.
+function drawFarmerPunch(F, vdir, t, ox, oy, alpha) {
+  const [key, fl] = VDIR[vdir] || VDIR.down;
+  let i = 0, ms = t * 1000;
+  while (i < PUNCH_MS.length - 1 && ms >= PUNCH_MS[i]) { ms -= PUNCH_MS[i]; i++; }
+  const m = PUNCH[key][i], img = F[(fl ? 'p_' + key + 'L' : 'p_' + key)][i];
+  ctx.globalAlpha = alpha;
+  ctx.drawImage(img, fl ? ox + 24 - m.x - img.width : ox + m.x, oy + m.y);
+  if (SAVE.hat && SPR.hat[SAVE.hat]) {
+    const cx = fl ? 23 - m.cx : m.cx, hat = fl ? SPR.hatL[SAVE.hat] : SPR.hat[SAVE.hat];
+    ctx.drawImage(hat, ox + Math.round(cx - 5.5), oy + m.ht - 1);
+  }
+  ctx.globalAlpha = 1;
+}
+function drawPlayer() {
+  const P = S.player;
+  let frame = 0, sink = 0;
+  if (P.actT > 0) sink = 1;
+  else if (P.moving) frame = Math.floor(P.animT * 1000 / WALK_FRAME_MS) % 4;   // same 4-frame, 100ms loop as the sheet
+  const x = Math.round(P.x) - 8, fy = Math.round(P.y) + MAP_Y;
+  R(x + 3, fy - 1, 10, 2, 5);                   // shadow
+  const alpha = (P.flash > 0 && Math.floor(frameT * 16) % 2) ? 0.35 : 1;
+  const F = SPR.farmer[SAVE.outfit] || SPR.farmer.none;
+  if (P.punchT > 0 && !P.moving) drawFarmerPunch(F, P.vdir || P.dir, P.punchAnim, Math.round(P.x) - 12, fy - 23, alpha);
+  else drawFarmerAt(F, P.vdir || P.dir, frame, x, fy + sink, alpha);
+  // Stamina pips above the head (only while not full)
+  if (P.stam < STAMINA_MAX) {
+    const bx = Math.round(P.x) - 10, by = fy - 23, per = STAMINA_MAX / STAMINA_LEVELS;
+    R(bx - 1, by - 1, STAMINA_LEVELS * 4 + 1, 4, 1);
+    for (let i = 0; i < STAMINA_LEVELS; i++) {
+      const fill = Math.max(0, Math.min(1, (P.stam - i * per) / per));
+      R(bx + i * 4, by, 3, 2, 2);
+      if (fill > 0) R(bx + i * 4, by, Math.max(1, Math.round(3 * fill)), 2, stamCol(P));
+    }
+  }
+  if (P.actT > 0 && P.tool) {
+    if (P.tool === 'shovel') {
+      if (!S.shovel) return;                                  // bare fists: the punch animation is the attack
+      const f = frontPoint(), img = (P.dir === 'left' ? SPR.shovelL : SPR.shovel)[S.shovel];
+      const swing = Math.round((P.actT / 0.25) * 5);
+      ctx.drawImage(img, Math.round(f.x) - 4, Math.round(f.y) + MAP_Y - 6 - swing);
+    } else {
+      const { c, r } = targetTile();
+      const img = (P.dir === 'left' ? SPR.toolL : SPR.tool)[P.tool];
+      const lift = Math.round((P.actT / 0.22) * 4);
+      ctx.drawImage(img, c * TILE + 4, r * TILE + MAP_Y + 2 - lift);
+    }
+  }
+}
+function stamCol(P) { return P.tired ? (Math.floor(frameT * 6) % 2 ? 11 : 13) : P.stam > 40 ? 9 : 10; }
+// Plays the walk cycle while moving; the attack animation only plays while a zombie is eating a crop,
+// and then the zombie glows red.
+const ZOMBIE_ATTACK_TOTAL = ZOMBIE_ATTACK_MS.reduce((a, b) => a + b, 0);
+function zombieAttackFrame(t) {
+  let ms = (t * 1000) % ZOMBIE_ATTACK_TOTAL;
+  for (let i = 0; i < ZOMBIE_ATTACK_MS.length; i++) { if (ms < ZOMBIE_ATTACK_MS[i]) return i; ms -= ZOMBIE_ATTACK_MS[i]; }
+  return 0;
+}
+function drawZFrame(set, meta, key, fl, i, ox, oy) {
+  const img = set[fl ? key + 'L' : key][i], m = meta[key][i];
+  ctx.drawImage(img, fl ? ox + 24 - m.x - img.width : ox + m.x, oy + m.y);
+}
+function drawZombie(z) {
+  if (z.guard && z.life < 6 && Math.floor(frameT * 10) % 2) return;  // blink before crumbling
+  const [key, fl] = VDIR[z.vdir] || VDIR.down;
+  let ox = Math.round(z.x) - 12, oy = Math.round(z.y) + MAP_Y - 23;     // top-left of the 24x24 sheet frame
+  if (z.lunge > 0 && z.breach) { const d = { up: [0, 1], right: [-1, 0], left: [1, 0] }[z.vdir] || [0, 0]; ox += d[0] * 2; oy += d[1] * 2; }
+  R(ox + 7, oy + 22, 10, 2, 5);                                         // shadow
+  const eating = !z.guard && z.target && z.eatT > 0 && !z.moving;
+  if (eating) {
+    const i = zombieAttackFrame(z.atkAnim);
+    // red glow: pulsing red outline around the body, then a light red tint on top
+    ctx.globalAlpha = 0.55 + 0.35 * Math.sin(frameT * 10);
+    for (const [dx, dy] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) drawZFrame(SPR.zattack.glow, ZOMBIE_ATTACK, key, fl, i, ox + dx, oy + dy);
+    ctx.globalAlpha = 1;
+    drawZFrame(z.flash > 0 ? SPR.zattack.flash : SPR.zattack.normal, ZOMBIE_ATTACK, key, fl, i, ox, oy);
+    ctx.globalAlpha = 0.25 + 0.15 * Math.sin(frameT * 10);
+    drawZFrame(SPR.zattack.glow, ZOMBIE_ATTACK, key, fl, i, ox, oy);
+    ctx.globalAlpha = 1;
+  } else {
+    const variant = z.guard ? 'guard' : z.flash > 0 ? 'flash' : z.frozen > 0 ? 'ice' : 'normal';
+    const i = z.moving ? Math.floor(z.t * 1000 / WALK_FRAME_MS) % 4 : 0;
+    drawZFrame(SPR.zwalk[variant], ZOMBIE_WALK, key, fl, i, ox, oy);
+  }
+  const bx = ox + 7, by = oy + 3;
+  if (!z.guard && z.hp < z.maxHp) { R(bx, by, 10, 2, 1); R(bx, by, Math.ceil(10 * z.hp / z.maxHp), 2, 11); }
+  if (z.guard) { R(bx, by, 10, 1, 1); R(bx, by, Math.ceil(10 * z.life / 40), 1, 9); }
+}
+function drawCorpse(c) {
+  let i = 0, ms = c.t * 1000;
+  while (i < ZDEATH_MS.length - 1 && ms >= ZDEATH_MS[i]) { ms -= ZDEATH_MS[i]; i++; }
+  const f = ZDEATH[i], ox = Math.round(c.x) - 12, oy = Math.round(c.y) + MAP_Y - 23;
+  const fade = c.t - ZDEATH_TOTAL;
+  if (fade > 0) ctx.globalAlpha = Math.max(0, 1 - fade / CORPSE_FADE);
+  ctx.drawImage(SPR.zdeath[i], ox + f.x, oy + f.y);
+  ctx.globalAlpha = 1;
+}
+function drawBone(b) {
+  if (b.life < 3 && Math.floor(frameT * 8) % 2) return;      // blink before it disappears
+  const i = Math.floor(b.t * 1000 / BONE_MS[0]) % BONE_ANIM.length, f = BONE_ANIM[i];
+  ctx.drawImage(SPR.bone[i], Math.round(b.x) + f.x, Math.round(b.y) + MAP_Y + f.y);
+}
+function drawCrow(k) {
+  const f = k.state === 'peck' ? (Math.floor(k.t * 6) % 2 ? 2 : 1) : Math.floor(k.t * 10) % 2;
+  const set = (k.vx < 0 ? SPR.birdL : SPR.bird)[k.type];
+  const x = Math.round(k.x) - 5, y = Math.round(k.y) + MAP_Y - 6;
+  if (k.state === 'fly' || k.state === 'flee') R(x + 2, Math.round(k.y) + MAP_Y + 6, 6, 1, 5);
+  if (k.flash > 0) ctx.globalAlpha = 0.5;
+  ctx.drawImage(set[f], x, y);
+  ctx.globalAlpha = 1;
+  if (k.state === 'peck') {
+    const B = BIRDS[k.type], left = Math.max(0, 1 - k.peckT / (B.eat * diff().eat));
+    R(x, y - 4, 10, 2, 1); R(x, y - 4, Math.ceil(10 * left), 2, B.bar);
+  }
+}
+function bracket(x, y, w, h, col) {
+  R(x, y, 4, 1, col); R(x, y, 1, 4, col); R(x + w - 4, y, 4, 1, col); R(x + w - 1, y, 1, 4, col);
+  R(x, y + h - 1, 4, 1, col); R(x, y + h - 4, 1, 4, col); R(x + w - 4, y + h - 1, 4, 1, col); R(x + w - 1, y + h - 4, 1, 4, col);
+}
+function drawWorld(map, live) {
+  GMAP = map;
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) drawTile(map[r][c], c, r);
+  ctx.drawImage(SPR.rack, 16, 16 + MAP_Y);
+  for (const k in BUILDINGS) {
+    const b = BUILDINGS[k], bx = b.c * TILE, by = b.r * TILE + MAP_Y;
+    ctx.drawImage(SPR[k], bx, by);
+    text(b.sign, bx + b.sx, by + b.sy, 1, 1, false);
+  }
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) if (map[r][c].crop) drawCrop(map[r][c], c, r, live);
+  if (!live) return;
+
+  // Target highlight: zombie in reach (red) or the tile you'll act on
+  if (mode === 'play' && S.player.actT <= 0) {
+    const z = zombieInFront();
+    if (z) bracket(Math.round(z.x) - 8, Math.round(z.y) + MAP_Y - 18, 16, 20, Math.floor(frameT * 6) % 2 ? 11 : 16);
+    else {
+      const { c, r } = targetTile(), t = tileAt(c, r);
+      if (t && (t.type === 'grass' || t.type === 'soil' || t.type === 'shed' || t.type === 'stall' || t.type === 'boutique')) {
+        bracket(c * TILE, r * TILE + MAP_Y, 16, 16, Math.floor(frameT * 3) % 2 ? 16 : 10);
+      }
+    }
+  }
+  // Mouse hover and click feedback
+  if (mode === 'play' && mouse.in && mouse.hoverT > 0 && mouse.y >= MAP_Y) {
+    const hc = Math.floor(mouse.x / TILE), hr = Math.floor((mouse.y - MAP_Y) / TILE);
+    if (tileAt(hc, hr)) { ctx.globalAlpha = 0.5; bracket(hc * TILE + 1, hr * TILE + MAP_Y + 1, 14, 14, 15); ctx.globalAlpha = 1; }
+  }
+  if (S.clickFx && S.clickFx.life > 0) {
+    const f = S.clickFx, g = Math.round((0.4 - f.life) * 15);
+    bracket(Math.round(f.x) - 4 - g, Math.round(f.y) + MAP_Y - 4 - g, 8 + g * 2, 8 + g * 2, f.col);
+  }
+  // Actors sorted by feet position
+  const actors = S.zombies.map(z => ({ y: z.y, f: () => drawZombie(z) }))
+    .concat(S.corpses.map(c => ({ y: c.y - 1, f: () => drawCorpse(c) })))
+    .concat(S.bones.map(b => ({ y: b.y, f: () => drawBone(b) })))
+    .concat([{ y: S.player.y, f: drawPlayer }]);
+  actors.sort((a, b) => a.y - b.y);
+  for (const a of actors) a.f();
+  for (const k of S.crows) drawCrow(k);
+  for (const p of S.parts) R(Math.round(p.x), Math.round(p.y) + MAP_Y, 1, 1, p.col);
+  for (const d of S.debris) {
+    if (d.life < 0.4) ctx.globalAlpha = Math.max(0, d.life / 0.4);
+    if (d.img) ctx.drawImage(d.img, d.sx, d.sy, d.w, d.h, Math.round(d.x), Math.round(d.y - d.z) + MAP_Y, d.w, d.h);
+    else { ctx.fillStyle = d.col; ctx.fillRect(Math.round(d.x), Math.round(d.y - d.z) + MAP_Y, d.w, d.h); }
+    ctx.globalAlpha = 1;
+  }
+  for (const p of S.pops) {
+    const w = textW(p.txt);
+    if (p.life > 0.15 || Math.floor(frameT * 20) % 2) text(p.txt, Math.round(p.x - w / 2), Math.round(p.y) + MAP_Y, p.col);
+  }
+  // Dusk tint near the end of the day
+  if (S.time < 25) {
+    ctx.globalAlpha = Math.min(0.4, (1 - S.time / 25) * 0.4);
+    R(0, MAP_Y, W, H - MAP_Y, 14);
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawBox(x, y, w, h) {
+  R(x, y, w, h, 1); R(x + 1, y + 1, w - 2, h - 2, 4); R(x + 2, y + 2, w - 4, h - 4, 2);
+}
+function drawMenuIcon() {
+  const b = MENU_BTN, hov = mouse.in && mouse.x >= b.x && mouse.x < b.x + b.w && mouse.y >= b.y && mouse.y < b.y + b.h;
+  R(b.x, b.y, b.w, b.h, 1); R(b.x + 1, b.y + 1, b.w - 2, b.h - 2, hov ? 4 : 3);
+  for (let i = 0; i < 3; i++) R(b.x + 4, b.y + 4 + i * 4, b.w - 8, 2, 16);
+}
+function drawHUD() {
+  R(0, 0, W, MAP_Y, 2); R(0, MAP_Y - 1, W, 1, 1);
+  const P = S.player;
+  // gold, score, stamina
+  ctx.drawImage(SPR.coin, 6, 4); text(S.gold + 'G', 15, 5, 10);
+  text('SCORE ' + S.score, 6, 13, 16);
+  text('STAMINA', 6, 21, P.tired ? 11 : 7);
+  const per = STAMINA_MAX / STAMINA_LEVELS;
+  R(36, 20, STAMINA_LEVELS * 7 + 1, 7, 1);
+  for (let i = 0; i < STAMINA_LEVELS; i++) {
+    const fill = Math.max(0, Math.min(1, (P.stam - i * per) / per));
+    R(37 + i * 7, 21, 6, 5, 2);
+    if (fill > 0) R(37 + i * 7, 21, Math.max(1, Math.round(6 * fill)), 5, stamCol(P));
+  }
+  if (P.tired) text('SLOW', 76, 21, 11);
+  // day, timer, threat
+  text('DAY ' + S.day + '/' + MAX_DAYS, 100, 5, 16);
+  const frac = Math.max(0, S.time / DAY_LEN);
+  R(100, 13, 62, 5, 1); R(101, 14, Math.round(60 * frac), 3, S.time < 25 ? 11 : 10);
+  for (let t = THREAT_EVERY; t < DAY_LEN; t += THREAT_EVERY) R(101 + Math.round(60 * t / DAY_LEN), 13, 1, 5, 1);
+  text('THREAT ' + S.threat, 100, 21, S.threat >= 5 ? 11 : S.threat >= 2 ? 10 : 7);
+  // rent, best, difficulty
+  const rent = rentFor(S.day);
+  text('RENT ' + rent + 'G', 176, 5, S.gold >= rent ? 9 : 11);
+  text('BEST ' + Math.max(SAVE.best, S.score), 176, 13, 7);
+  text(diff().name, 176, 21, SAVE.diff === 'hard' ? 11 : SAVE.diff === 'easy' ? 9 : 7);
+  // seed, shovel, boosts
+  const k = SEED_ORDER[S.sel], icon = SPR.ripe[k], sb = SEED_BOX;
+  R(sb.x, sb.y, sb.w, sb.h, 1); R(sb.x + 1, sb.y + 1, sb.w - 2, sb.h - 2, 3);
+  ctx.save(); ctx.beginPath(); ctx.rect(sb.x + 1, sb.y + 1, sb.w - 2, sb.h - 2); ctx.clip();
+  ctx.drawImage(icon, sb.x + 11 - (icon.width >> 1), sb.y + sb.h - 3 - icon.height);
+  ctx.restore();
+  text(CROPS[k].name + ' X' + S.seeds[k], 274, 5, S.seeds[k] ? 16 : 13);
+  text(isTouch ? 'B: NEXT SEED' : 'Q/E OR CLICK BOX: SEED', 274, 13, 7);
+  if (S.shovel) {
+    ctx.drawImage(SPR.shovel[S.shovel], 274, 19);
+    const u = S.shovelUses[S.shovel];
+    text(SHOVELS[S.shovel].name + ' ' + u + '/' + SHOVEL_USES, 285, 21, u <= 5 ? 11 : SHOVELS[S.shovel].rc);
+  } else text('FISTS', 274, 21, FISTS.rc);
+  let bx = 364;
+  for (const b in BOOSTS) if (S.boosts[b]) { ctx.drawImage(SPR.potion[b], bx, 20); bx += 8; }
+  if (muted) text('MUTE', W - 46, 13, 13);
+  drawMenuIcon();
+}
+function drawToast() {
+  if (S.msgT <= 0) return;
+  const w = textW(S.msg) + 10, x = Math.round((W - w) / 2), y = H - 20;
+  drawBox(x, y, w, 12); text(S.msg, x + 5, y + 4, 16);
+}
+function drawShop() {
+  ctx.globalAlpha = 0.55; R(0, 0, W, H, 1); ctx.globalAlpha = 1;
+  const shop = SHOPS[S.shop], bx = SHOP_BOX.x, by = SHOP_BOX.y, bw = SHOP_BOX.w, bh = SHOP_BOX.h;
+  drawBox(bx, by, bw, bh);
+  text(shop.title, bx + 8, by + 7, 10);
+  ctx.drawImage(SPR.coin, bx + bw - 44, by + 6);
+  text(S.gold + 'G', bx + bw - 35, by + 7, 10);
+  R(bx + 6, by + 15, bw - 12, 1, 4);
+  const end = Math.min(shop.items.length, S.shopScroll + SHOP_ROWS);
+  for (let i = S.shopScroll; i < end; i++) {
+    const it = shop.items[i], o = itemInfo(it), y = by + 20 + (i - S.shopScroll) * 11, sel = i === S.shopIdx;
+    if (sel) { R(bx + 5, y - 2, bw - 10, 10, 3); text('>', bx + 8, y, 10); }
+    ctx.save(); ctx.beginPath(); ctx.rect(bx + 14, y - 2, 13, 10); ctx.clip();
+    ctx.drawImage(o.icon, bx + 20 - (o.icon.width >> 1), Math.min(y - 1, y + 7 - o.icon.height));
+    ctx.restore();
+    text(o.name, bx + 30, y, sel ? 16 : 7);
+    const ownedItem = o.owned && it.kind !== 'boost';
+    text(ownedItem ? '-' : o.cost + 'G', bx + 134, y, o.afford ? 10 : 11);
+    text(o.right, bx + 166, y, o.rightCol);
+  }
+  // scroll arrows
+  if (S.shopScroll > 0) { R(bx + bw - 11, by + 19, 5, 1, 10); R(bx + bw - 10, by + 18, 3, 1, 10); R(bx + bw - 9, by + 17, 1, 1, 10); }
+  if (end < shop.items.length) { const ay = by + 20 + SHOP_ROWS * 11 - 4; R(bx + bw - 11, ay, 5, 1, 10); R(bx + bw - 10, ay + 1, 3, 1, 10); R(bx + bw - 9, ay + 2, 1, 1, 10); }
+  R(bx + 6, by + bh - 26, bw - 12, 1, 4);
+  text(itemInfo(shop.items[S.shopIdx]).desc, bx + 8, by + bh - 21, 16);
+  text(isTouch ? 'TAP OR A: BUY/USE   TAP OUTSIDE OR B: CLOSE' : 'CLICK/ENTER: BUY/USE   CLICK OUTSIDE/ESC: CLOSE', bx + 8, by + bh - 11, 7);
+}
+function drawCenterPanel(lines, h) {
+  ctx.globalAlpha = 0.55; R(0, 0, W, H, 1); ctx.globalAlpha = 1;
+  const bw = 210, bx = (W - bw) >> 1, by = Math.round((H - h) / 2);
+  drawBox(bx, by, bw, h);
+  let y = by + 10;
+  for (const l of lines) { textC(l.t, y, l.c || 16, l.s || 1); y += (l.s || 1) * 5 + (l.gap || 5); }
+}
+const TITLE_DIRS = ['down', 'downright', 'right', 'upright', 'up', 'upleft', 'left', 'downleft'];
+function drawTitle() {
+  R(0, 0, W, MAP_Y, 2); R(0, MAP_Y - 1, W, 1, 1);
+  ctx.globalAlpha = 0.5; R(0, 0, W, H, 1); ctx.globalAlpha = 1;
+  textC('PAY OR DIE', 26, 11, 5);
+  textC('GROW, GAMBLE, BONK ZOMBIES... AND PAY THE RENT', 60, 16);
+  // the farmer walks in place, turning through all 8 directions of the walk cycle
+  const F = SPR.farmer[SAVE.outfit] || SPR.farmer.none;
+  const vdir = TITLE_DIRS[Math.floor(frameT / 1.6) % 8], frame = Math.floor(frameT * 1000 / WALK_FRAME_MS) % 4;
+  drawFarmerAt(F, vdir, frame, (W >> 1) - 32, 150, 1, 4);
+  if (Math.floor(frameT * 2) % 2) textC(isTouch ? 'TAP A TO START' : 'PRESS ENTER OR CLICK TO START', 168, 10);
+  textC('BEST SCORE ' + SAVE.best + '    DIFFICULTY ' + diff().name, 182, 16);
+  textC(isTouch ? 'TAP TO MOVE AND FARM   A ACTION/ATTACK   B NEXT SEED' : 'LEFT CLICK: MOVE, FARM, SHOP    RIGHT CLICK: ATTACK', 210, 7);
+  textC(isTouch ? 'MENU BUTTON (TOP RIGHT): SOUND, DIFFICULTY AND MORE' : 'WASD + SPACE    Q/E SEEDS    ESC MENU    M MUTE', 222, 7);
+  textC('YOU START WITH FISTS. SHOVELS BREAK AFTER ' + SHOVEL_USES + ' SWINGS. EVERY HIT USES STAMINA.', 240, 13);
+  text('MENU', MENU_BTN.x - 19, MENU_BTN.y + 7, 7);
+  drawMenuIcon();
+}
+
+// ---- Menu (sound, difficulty, controls, restart, main menu)
+let menuFrom = 'title', menuIdx = 0, menuView = 'main';
+function openMenu(from) {
+  menuFrom = from; menuIdx = 0; menuView = 'main'; mode = 'menu';
+  if (S && S.player) S.player.goal = null;
+  SFX.select();
+}
+function closeMenu() { mode = menuFrom === 'title' ? 'title' : 'play'; }
+function menuItems() {
+  const inRun = menuFrom !== 'title', it = [];
+  it.push(inRun ? { id: 'resume', label: 'RESUME' } : { id: 'start', label: 'START GAME' });
+  it.push({ id: 'volume', label: 'VOLUME', value: Math.round(SAVE.volume * 100) + '%' });
+  it.push({ id: 'music', label: 'MUSIC', value: SAVE.music ? 'ON' : 'OFF' });
+  it.push({ id: 'mute', label: 'MUTE ALL', value: SAVE.muted ? 'ON' : 'OFF' });
+  it.push({ id: 'diff', label: 'DIFFICULTY', value: diff().name + (inRun ? ' (LOCKED)' : ''), locked: inRun });
+  it.push({ id: 'controls', label: 'CONTROLS' });
+  if (inRun) { it.push({ id: 'restart', label: 'RESTART RUN' }); it.push({ id: 'title', label: 'QUIT TO MAIN MENU' }); }
+  else it.push({ id: 'close', label: 'CLOSE' });
+  return it;
+}
+function menuAdjust(item, dir) {
+  if (item.id === 'volume') {
+    SAVE.volume = Math.max(0, Math.min(1, Math.round((SAVE.volume + dir * 0.1) * 10) / 10));
+    if (SAVE.volume > 0) SAVE.muted = false;
+  } else if (item.id === 'music') SAVE.music = !SAVE.music;
+  else if (item.id === 'mute') SAVE.muted = !SAVE.muted;
+  else if (item.id === 'diff') {
+    if (item.locked) { SFX.error(); return; }
+    SAVE.diff = DIFF_ORDER[(DIFF_ORDER.indexOf(SAVE.diff) + dir + 3) % 3];
+  } else return;
+  applyAudio(); writeSave(); SFX.select();
+}
+function menuActivate(item) {
+  switch (item.id) {
+    case 'start': case 'restart': newGame(); mode = 'play'; SFX.coin(); break;
+    case 'resume': case 'close': closeMenu(); break;
+    case 'title': mode = 'title'; break;
+    case 'controls': menuView = 'controls'; SFX.select(); break;
+    case 'volume': menuAdjust(item, SAVE.volume >= 1 ? -10 : 1); break;
+    default: menuAdjust(item, 1);
+  }
+}
+function menuLayout() {
+  if (menuView === 'controls') { const w = 320, h = 176; return { x: (W - w) >> 1, y: (H - h) >> 1, w, h }; }
+  const n = menuItems().length, w = 240, h = 30 + n * 14 + 16;
+  return { x: (W - w) >> 1, y: (H - h) >> 1, w, h };
+}
+function menuRowAt(x, y) {
+  const L = menuLayout();
+  if (menuView !== 'main' || x < L.x || x > L.x + L.w) return -1;
+  const row = Math.floor((y - (L.y + 23)) / 14);
+  return row >= 0 && row < menuItems().length ? row : -1;
+}
+function menuClick(ck) {
+  const L = menuLayout();
+  if (menuView === 'controls') { menuView = 'main'; SFX.select(); return; }
+  if (ck.btn === 2 || ck.x < L.x || ck.x > L.x + L.w || ck.y < L.y || ck.y > L.y + L.h) { closeMenu(); return; }
+  const row = menuRowAt(ck.x, ck.y);
+  if (row < 0) return;
+  menuIdx = row;
+  const item = menuItems()[row];
+  if (item.value !== undefined && ck.x >= L.x + 120) menuAdjust(item, ck.x < L.x + 120 + (L.w - 120) / 2 ? -1 : 1);
+  else menuActivate(item);
+}
+function updateMenu() {
+  if (menuView === 'controls') {
+    if (pressed.has('a') || pressed.has('b') || pressed.has('pause')) { menuView = 'main'; SFX.select(); }
+    return;
+  }
+  const items = menuItems(), n = items.length;
+  if (menuIdx >= n) menuIdx = n - 1;
+  if (pressed.has('up')) { menuIdx = (menuIdx + n - 1) % n; SFX.select(); }
+  if (pressed.has('down')) { menuIdx = (menuIdx + 1) % n; SFX.select(); }
+  if (pressed.has('left')) menuAdjust(items[menuIdx], -1);
+  if (pressed.has('right')) menuAdjust(items[menuIdx], 1);
+  if (mouse.moved) { const i = menuRowAt(mouse.x, mouse.y); if (i >= 0) menuIdx = i; }
+  if (pressed.has('a')) menuActivate(items[menuIdx]);
+  else if (pressed.has('pause') || pressed.has('b')) closeMenu();
+}
+const CONTROL_LINES = [
+  ['KEYBOARD', 10], ['WASD / ARROWS   MOVE', 16], ['SPACE / ENTER   ACTION, HARVEST, ATTACK', 16],
+  ['Q / E   CHANGE SEED      1-5   PICK SEED', 16], ['P / ESC   MENU      M   MUTE', 16], ['', 16],
+  ['MOUSE', 10], ['LEFT CLICK   MOVE, FARM, HARVEST, SHOP', 16], ['RIGHT CLICK   ATTACK (HOLD TO KEEP SWINGING)', 16],
+  ['WHEEL   SCROLL SHOP LISTS', 16], ['', 16],
+  ['STAMINA: EVERY SWING COSTS ONE LEVEL.', 7], ['AT ZERO YOU MOVE AT HALF SPEED UNTIL IT REFILLS.', 7],
+];
+function drawMenu() {
+  ctx.globalAlpha = 0.6; R(0, 0, W, H, 1); ctx.globalAlpha = 1;
+  const L = menuLayout();
+  drawBox(L.x, L.y, L.w, L.h);
+  if (menuView === 'controls') {
+    text('CONTROLS', L.x + 10, L.y + 8, 10, 2);
+    CONTROL_LINES.forEach(([t, c], i) => text(t, L.x + 12, L.y + 28 + i * 10, c));
+    text(isTouch ? 'TAP TO GO BACK' : 'CLICK OR ESC TO GO BACK', L.x + 12, L.y + L.h - 12, 7);
+    return;
+  }
+  text(menuFrom === 'title' ? 'SETTINGS' : 'PAUSED', L.x + 10, L.y + 8, 10, 2);
+  menuItems().forEach((it, i) => {
+    const y = L.y + 26 + i * 14, sel = i === menuIdx;
+    if (sel) R(L.x + 4, y - 3, L.w - 8, 11, 3);
+    text((sel ? '> ' : '  ') + it.label, L.x + 8, y, sel ? 16 : 7);
+    if (it.value !== undefined) {
+      const vx = L.x + 120, col = it.locked ? 13 : 10;
+      text('<', vx, y, it.locked ? 13 : 16);
+      text(it.value, vx + 10, y, col);
+      if (it.id === 'volume') { R(vx + 32, y, 62, 5, 1); R(vx + 33, y + 1, Math.round(60 * SAVE.volume), 3, SAVE.muted ? 13 : 9); }
+      text('>', L.x + L.w - 14, y, it.locked ? 13 : 16);
+    }
+  });
+  text(isTouch ? 'D-PAD: CHANGE   A: SELECT   B: BACK' : 'ARROWS/CLICK: CHANGE   ENTER: SELECT   ESC: BACK', L.x + 10, L.y + L.h - 12, 7);
+}
+
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  R(0, 0, W, H, 1);
+  let sx = 0, sy = 0;
+  if (shakeT > 0) { sx = Math.round((Math.random() * 2 - 1) * shakeMag); sy = Math.round((Math.random() * 2 - 1) * shakeMag); }
+  ctx.setTransform(1, 0, 0, 1, sx, sy);
+  if (mode === 'title' || (mode === 'menu' && menuFrom === 'title')) {
+    drawWorld(titleMap, false);
+    drawTitle();
+  } else {
+    drawWorld(S.map, true);
+    drawHUD();
+    if (mode === 'play') drawToast();
+    if (mode === 'shop') drawShop();
+    if (mode === 'dayend') drawCenterPanel([
+      { t: 'DAY ' + S.day + ' DONE', c: 10, s: 2, gap: 8 },
+      { t: 'RENT PAID: ' + S.paid + 'G' },
+      { t: 'GOLD LEFT: ' + S.gold + 'G' },
+      { t: 'TOMORROW\'S RENT: ' + rentFor(S.day + 1) + 'G', c: 11, gap: 9 },
+      { t: isTouch ? 'TAP A FOR THE NEXT DAY' : 'PRESS ENTER FOR THE NEXT DAY', c: 7 }], 78);
+    if (mode === 'over') drawCenterPanel([
+      { t: S.overReason, c: 11, s: 2, gap: 8 },
+      { t: S.overSub },
+      { t: 'SCORE ' + S.score + '   DAY ' + S.day + '/' + MAX_DAYS + '   ZOMBIES ' + S.kills },
+      { t: S.newBest ? 'NEW BEST SCORE!' : 'BEST ' + SAVE.best, c: S.newBest ? 10 : 7, gap: 9 },
+      { t: isTouch ? 'TAP A TO CONTINUE' : 'PRESS ENTER TO CONTINUE', c: 7 }], 78);
+    if (mode === 'win') drawCenterPanel([
+      { t: 'FARM SAVED!', c: 10, s: 2, gap: 8 },
+      { t: 'ALL ' + MAX_DAYS + ' RENTS PAID' },
+      { t: 'SCORE ' + S.score + '   RARES ' + S.rares + '   ZOMBIES ' + S.kills },
+      { t: S.newBest ? 'NEW BEST SCORE!' : 'BEST ' + SAVE.best, c: S.newBest ? 10 : 7, gap: 9 },
+      { t: isTouch ? 'TAP A TO CONTINUE' : 'PRESS ENTER TO CONTINUE', c: 7 }], 78);
+  }
+  if (mode === 'menu') drawMenu();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+}
+
+/* =========================================================
+   MAIN LOOP (fixed timestep)
+   ========================================================= */
+loadSave();
+applyAudio();
+buildSprites();
+titleMap = buildTitleMap();
+let last = performance.now(), acc = 0;
+function frame(now) {
+  let dt = (now - last) / 1000; last = now;
+  if (dt > 0.25) dt = 0.25;
+  acc += dt;
+  while (acc >= STEP) { update(STEP); pressed.clear(); acc -= STEP; }
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+grabFocus();
+cvs.addEventListener('pointerenter', e => { if (e.pointerType === 'mouse' && document.activeElement !== cvs) grabFocus(); });
+</script>
+</body>
+</html>
